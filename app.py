@@ -6,7 +6,7 @@ import mysql.connector
 from mysql.connector import pooling
 
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder="static", static_url_path="/static")
 app.secret_key = "replace-with-a-secret-key"
 
 DB_CONFIG = {
@@ -17,510 +17,518 @@ DB_CONFIG = {
     "charset": "utf8mb4",
 }
 
-connection_pool = pooling.MySQLConnectionPool(
-    pool_name="mis_423_pool",
-    pool_size=5,
-    pool_reset_session=True,
-    **DB_CONFIG,
+
+STUDENT_TICKET_NAMES = (
+    "QUIE本校学生票",
+    "泉州本校学生票",
 )
 
 
+_connection_pool = None
+
+
 def get_connection():
-    return connection_pool.get_connection()
+    global _connection_pool
+    if _connection_pool is None:
+        _connection_pool = pooling.MySQLConnectionPool(
+            pool_name="mis_423_pool",
+            pool_size=5,
+            pool_reset_session=True,
+            **DB_CONFIG,
+        )
+    return _connection_pool.get_connection()
 
 
 def ensure_password_column():
-  conn = get_connection()
-  cursor = conn.cursor()
-  try:
-    cursor.execute("SHOW COLUMNS FROM users LIKE 'password'")
-    has_column = cursor.fetchone()
-    if not has_column:
-      cursor.execute(
-        "ALTER TABLE users ADD COLUMN password VARCHAR(128) NOT NULL AFTER identifier"
-      )
-      conn.commit()
-  finally:
-    cursor.close()
-    conn.close()
+    conn = get_connection()
+    cursor = conn.cursor()
+    altered = False
+    try:
+        cursor.execute("SHOW COLUMNS FROM users LIKE 'password'")
+        if cursor.fetchone() is None:
+            cursor.execute(
+                "ALTER TABLE users ADD COLUMN password VARCHAR(255) NOT NULL DEFAULT '' AFTER identifier"
+            )
+            altered = True
+        if altered:
+            conn.commit()
+    except mysql.connector.Error:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
 
 
 def ensure_order_status_columns():
-  conn = get_connection()
-  cursor = conn.cursor()
-  altered = False
-  try:
-    cursor.execute("SHOW COLUMNS FROM orders LIKE 'status'")
-    status_column = cursor.fetchone()
-    if status_column:
-      column_type = status_column[1] if len(status_column) > 1 else ""
-      desired_enum = "enum('PENDING','COMPLETED','PAID','CANCELLED')"
-      if desired_enum not in column_type.lower():
-        cursor.execute(
-          "ALTER TABLE orders MODIFY COLUMN status ENUM('PENDING','COMPLETED','PAID','CANCELLED') NOT NULL DEFAULT 'PENDING'"
-        )
-        altered = True
+    conn = get_connection()
+    cursor = conn.cursor()
+    altered = False
+    try:
+        cursor.execute("SHOW COLUMNS FROM orders LIKE 'status'")
+        status_column = cursor.fetchone()
+        desired_enum = "ENUM('PENDING','COMPLETED','PAID','CANCELLED')"
+        if status_column is None:
+            cursor.execute(
+                "ALTER TABLE orders ADD COLUMN status "
+                + desired_enum
+                + " NOT NULL DEFAULT 'PENDING' AFTER user_id"
+            )
+            altered = True
+        else:
+            column_type = status_column[1]
+            if "enum" in column_type.lower() and "PENDING" not in column_type:
+                cursor.execute(
+                    "ALTER TABLE orders MODIFY status "
+                    + desired_enum
+                    + " NOT NULL DEFAULT 'PENDING'"
+                )
+                altered = True
 
-    cursor.execute("SHOW COLUMNS FROM orders LIKE 'paid_at'")
-    has_paid_at = cursor.fetchone()
-    if not has_paid_at:
-      cursor.execute("ALTER TABLE orders ADD COLUMN paid_at DATETIME NULL AFTER created_at")
-      altered = True
+        cursor.execute("SHOW COLUMNS FROM orders LIKE 'paid_at'")
+        if cursor.fetchone() is None:
+            cursor.execute(
+                "ALTER TABLE orders ADD COLUMN paid_at DATETIME NULL AFTER total_amount")
+            altered = True
 
-    if altered:
-      conn.commit()
-  finally:
-    cursor.close()
-    conn.close()
+        cursor.execute("SHOW COLUMNS FROM orders LIKE 'order_sn'")
+        if cursor.fetchone() is None:
+            cursor.execute(
+                "ALTER TABLE orders ADD COLUMN order_sn VARCHAR(64) NOT NULL AFTER id")
+            cursor.execute(
+                "CREATE UNIQUE INDEX idx_orders_sn ON orders(order_sn)")
+            altered = True
+
+        if altered:
+            conn.commit()
+    except mysql.connector.Error:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
 
 
 def fetch_ticket_types():
-  conn = get_connection()
-  cursor = conn.cursor(dictionary=True)
-  try:
-    cursor.execute(
-      "SELECT id, name, price, description FROM ticket_types WHERE is_active = 1 ORDER BY id"
-    )
-    return cursor.fetchall()
-  finally:
-    cursor.close()
-    conn.close()
-
-
-def fetch_orders_with_details():
-  conn = get_connection()
-  cursor = conn.cursor(dictionary=True)
-  try:
-    cursor.execute(
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            """
+      SELECT id, name, price, description
+      FROM ticket_types
+      WHERE is_active = 1
+      ORDER BY id
       """
-      SELECT o.id, o.order_sn, o.status, o.total_amount, o.created_at, o.paid_at,
-           u.identifier
-      FROM orders o
-      JOIN users u ON o.user_id = u.id
-      ORDER BY o.created_at DESC
-      """
-    )
-    orders = cursor.fetchall()
-
-    cursor.execute(
-      """
-      SELECT od.order_id, tt.name, od.quantity, od.unit_price
-      FROM order_details od
-      JOIN ticket_types tt ON od.ticket_type_id = tt.id
-      ORDER BY od.order_id
-      """
-    )
-    details = cursor.fetchall()
-  finally:
-    cursor.close()
-    conn.close()
-
-  detail_map = {}
-  for row in details:
-    detail_map.setdefault(row["order_id"], []).append(row)
-
-  for order in orders:
-    order["details"] = detail_map.get(order["id"], [])
-
-  return orders
-
-
-def fetch_order_summary(order_id):
-  conn = get_connection()
-  cursor = conn.cursor(dictionary=True)
-  try:
-    cursor.execute(
-      """
-      SELECT id, order_sn, user_id, status, total_amount, created_at, paid_at
-      FROM orders
-      WHERE id = %s
-      """,
-      (order_id,),
-    )
-    order = cursor.fetchone()
-    if not order:
-      return None
-
-    cursor.execute(
-      """
-      SELECT od.ticket_type_id, tt.name, od.quantity, od.unit_price
-      FROM order_details od
-      JOIN ticket_types tt ON od.ticket_type_id = tt.id
-      WHERE od.order_id = %s
-      ORDER BY tt.id
-      """,
-      (order_id,),
-    )
-    order["details"] = cursor.fetchall()
-    return order
-  finally:
-    cursor.close()
-    conn.close()
-
-
-def fetch_users():
-  conn = get_connection()
-  cursor = conn.cursor(dictionary=True)
-  try:
-    cursor.execute(
-      "SELECT id, identifier, user_type, created_at FROM users ORDER BY created_at DESC"
-    )
-    return cursor.fetchall()
-  finally:
-    cursor.close()
-    conn.close()
-
-
-def get_user_by_identifier(identifier):
-  conn = get_connection()
-  cursor = conn.cursor(dictionary=True)
-  try:
-    query = "SELECT id, identifier, password, user_type FROM users WHERE identifier = %s"
-    cursor.execute(query, (identifier,))
-    return cursor.fetchone()
-  finally:
-    cursor.close()
-    conn.close()
+        )
+        return cursor.fetchall()
+    finally:
+        cursor.close()
+        conn.close()
 
 
 def get_ticket_type(ticket_type_id):
-  conn = get_connection()
-  cursor = conn.cursor(dictionary=True)
-  try:
-    cursor.execute(
-      "SELECT id, name, price FROM ticket_types WHERE id = %s",
-      (ticket_type_id,),
-    )
-    return cursor.fetchone()
-  finally:
-    cursor.close()
-    conn.close()
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            "SELECT id, name, price, description FROM ticket_types WHERE id = %s",
+            (ticket_type_id,),
+        )
+        return cursor.fetchone()
+    finally:
+        cursor.close()
+        conn.close()
 
 
-def update_order_status(order_id, status):
-  conn = get_connection()
-  cursor = conn.cursor()
-  try:
-    cursor.execute(
-      "UPDATE orders SET status = %s WHERE id = %s",
-      (status, order_id),
-    )
-    if cursor.rowcount:
-      conn.commit()
-      return True
-    conn.rollback()
-    return False
-  except mysql.connector.Error:
-    conn.rollback()
-    raise
-  finally:
-    cursor.close()
-    conn.close()
+def get_user_by_identifier(identifier):
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            "SELECT id, user_type, identifier, password FROM users WHERE identifier = %s",
+            (identifier,),
+        )
+        return cursor.fetchone()
+    finally:
+        cursor.close()
+        conn.close()
 
 
-def mark_order_paid(order_id):
-  conn = get_connection()
-  cursor = conn.cursor()
-  try:
-    cursor.execute(
-      "UPDATE orders SET status = %s, paid_at = NOW() WHERE id = %s",
-      ("PAID", order_id),
-    )
-    if cursor.rowcount:
-      conn.commit()
-      return True
-    conn.rollback()
-    return False
-  except mysql.connector.Error:
-    conn.rollback()
-    raise
-  finally:
-    cursor.close()
-    conn.close()
+def fetch_users():
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            """
+      SELECT id, user_type, identifier, created_at
+      FROM users
+      ORDER BY created_at DESC
+      """
+        )
+        return cursor.fetchall()
+    finally:
+        cursor.close()
+        conn.close()
 
 
-def delete_order(order_id):
-  conn = get_connection()
-  cursor = conn.cursor()
-  try:
-    cursor.execute("DELETE FROM order_details WHERE order_id = %s", (order_id,))
-    cursor.execute("DELETE FROM orders WHERE id = %s", (order_id,))
-    if cursor.rowcount:
-      conn.commit()
-      return True
-    conn.rollback()
-    return False
-  except mysql.connector.Error:
-    conn.rollback()
-    raise
-  finally:
-    cursor.close()
-    conn.close()
+def fetch_orders_with_details():
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            """
+      SELECT
+        o.id,
+        o.order_sn,
+        o.user_id,
+        u.identifier,
+        o.status,
+        o.total_amount,
+        o.created_at,
+        o.paid_at,
+        od.id AS detail_id,
+        od.ticket_type_id,
+        od.quantity,
+        od.unit_price,
+        tt.name AS ticket_name
+      FROM orders o
+      LEFT JOIN users u ON o.user_id = u.id
+      LEFT JOIN order_details od ON od.order_id = o.id
+      LEFT JOIN ticket_types tt ON od.ticket_type_id = tt.id
+      ORDER BY o.created_at DESC, od.id ASC
+      """
+        )
+        rows = cursor.fetchall()
+        orders = []
+        order_map = {}
+        for row in rows:
+            order_id = row["id"]
+            order = order_map.get(order_id)
+            if order is None:
+                order = {
+                    "id": order_id,
+                    "order_sn": row["order_sn"],
+                    "user_id": row["user_id"],
+                    "identifier": row.get("identifier"),
+                    "status": row["status"],
+                    "total_amount": row["total_amount"],
+                    "created_at": row["created_at"],
+                    "paid_at": row.get("paid_at"),
+                    "details": [],
+                }
+                order_map[order_id] = order
+                orders.append(order)
+            if row["detail_id"]:
+                order["details"].append(
+                    {
+                        "ticket_type_id": row["ticket_type_id"],
+                        "name": row.get("ticket_name"),
+                        "quantity": row["quantity"],
+                        "unit_price": row["unit_price"],
+                    }
+                )
+        return orders
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def fetch_order_summary(order_id):
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            """
+      SELECT
+        o.id,
+        o.order_sn,
+        o.user_id,
+        o.status,
+        o.total_amount,
+        o.created_at,
+        o.paid_at,
+        od.id AS detail_id,
+        od.ticket_type_id,
+        od.quantity,
+        od.unit_price,
+        tt.name AS ticket_name
+      FROM orders o
+      LEFT JOIN order_details od ON od.order_id = o.id
+      LEFT JOIN ticket_types tt ON od.ticket_type_id = tt.id
+      WHERE o.id = %s
+      ORDER BY od.id ASC
+      """,
+            (order_id,),
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            return None
+
+        header = rows[0]
+        order = {
+            "id": header["id"],
+            "order_sn": header["order_sn"],
+            "user_id": header["user_id"],
+            "status": header["status"],
+            "total_amount": header["total_amount"],
+            "created_at": header["created_at"],
+            "paid_at": header.get("paid_at"),
+            "details": [],
+        }
+
+        for row in rows:
+            if row["detail_id"]:
+                order["details"].append(
+                    {
+                        "ticket_type_id": row["ticket_type_id"],
+                        "name": row.get("ticket_name"),
+                        "quantity": row["quantity"],
+                        "unit_price": row["unit_price"],
+                    }
+                )
+
+        return order
+    finally:
+        cursor.close()
+        conn.close()
 
 
 ADMIN_TEMPLATE = """
 <!doctype html>
-<html lang=\"zh\">
+<html lang="zh">
   <head>
-    <meta charset=\"utf-8\">
-    <title>管理后台 - QUIE野区大花园</title>
-    <style>
-      :root {
-        color-scheme: dark;
-      }
-      * {
-        box-sizing: border-box;
-      }
-      body {
-        margin: 0;
-        min-height: 100vh;
-        font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
-        background: radial-gradient(circle at left top, #2b205c 0%, #0c1324 55%, #04060c 100%);
-        color: #e6edf6;
-      }
-      .wrapper {
-        min-height: 100vh;
-        padding: 48px 40px 64px;
-        display: flex;
-        flex-direction: column;
-        gap: 32px;
-      }
-      .header {
-        display: flex;
-        justify-content: space-between;
-        align-items: baseline;
-        gap: 16px;
-        color: #94a3b8;
-      }
-      .header a {
-        color: #60a5fa;
-        text-decoration: none;
-      }
-      .header a:hover {
-        text-decoration: underline;
-      }
-      h1 {
-        margin: 0;
-        font-size: 34px;
-        color: #f8fafc;
-      }
-      .grid {
-        display: grid;
-        gap: 28px;
-      }
-      .card {
-        padding: 36px;
-        border-radius: 26px;
-        background: rgba(15, 23, 42, 0.78);
-        border: 1px solid rgba(148, 163, 184, 0.16);
-        box-shadow: 0 34px 130px rgba(15, 23, 42, 0.76);
-        backdrop-filter: blur(20px);
-      }
-      h2 {
-        margin: 0 0 20px;
-        font-size: 20px;
-        letter-spacing: 0.01em;
-      }
-      table {
-        width: 100%;
-        border-collapse: collapse;
-        border-radius: 18px;
-        overflow: hidden;
-        border: 1px solid rgba(148, 163, 184, 0.16);
-        background: rgba(10, 14, 23, 0.55);
-      }
-      th,
-      td {
-        padding: 14px 18px;
-        text-align: left;
-        font-size: 14px;
-      }
-      th {
-        background: rgba(96, 165, 250, 0.12);
-        color: #cbd5f5;
-        font-weight: 600;
-      }
-      tr + tr td {
-        border-top: 1px solid rgba(148, 163, 184, 0.1);
-      }
-      select,
-      input[type=\"text\"] {
-        padding: 8px 12px;
-        border-radius: 10px;
-        border: 1px solid rgba(148, 163, 184, 0.35);
-        background: rgba(15, 23, 42, 0.65);
-        color: inherit;
-        font-size: 13px;
-      }
-      select:focus,
-      input[type=\"text\"]:focus {
-        outline: none;
-        border-color: rgba(96, 165, 250, 0.65);
-        box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.22);
-      }
-      button {
-        padding: 8px 14px;
-        border-radius: 10px;
-        border: none;
-        font-size: 13px;
-        font-weight: 600;
-        color: #0b1220;
-        background: linear-gradient(135deg, #38bdf8 0%, #6366f1 45%, #a855f7 100%);
-        cursor: pointer;
-        transition: transform 0.18s ease, box-shadow 0.18s ease;
-      }
-      button:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 16px 55px rgba(99, 102, 241, 0.35);
-      }
-      form.inline {
-        display: inline-flex;
-        align-items: center;
-        gap: 10px;
-      }
-      .message {
-        margin-bottom: 24px;
-        padding: 14px 16px;
-        border-radius: 14px;
-        font-size: 14px;
-      }
-      .message.success {
-        background: rgba(34, 197, 94, 0.14);
-        border: 1px solid rgba(34, 197, 94, 0.28);
-        color: #bbf7d0;
-      }
-      .message.error {
-        background: rgba(239, 68, 68, 0.14);
-        border: 1px solid rgba(239, 68, 68, 0.28);
-        color: #fca5a5;
-      }
-      .message.info {
-        background: rgba(59, 130, 246, 0.12);
-        border: 1px solid rgba(59, 130, 246, 0.22);
-        color: #bfdbfe;
-      }
-      ul {
-        margin: 0;
-        padding-left: 18px;
-      }
-      li {
-        margin-bottom: 4px;
-      }
-      @media (max-width: 820px) {
-        .wrapper {
-          padding: 32px 20px 48px;
-        }
-        table {
-          font-size: 13px;
-        }
-        th,
-        td {
-          padding: 12px 14px;
-        }
-        form.inline {
-          flex-direction: column;
-          align-items: flex-start;
-        }
-      }
-    </style>
+    <meta charset="utf-8">
+    <title>管理后台 - 泉州野区大花园</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
   </head>
   <body>
-    <div class=\"wrapper\">
-      <div class=\"header\">
-        <h1>订单管理</h1>
-        <a href=\"{{ url_for('login') }}\">返回登录</a>
-      </div>
-      <div class=\"grid\">
-        <div class=\"card\">
-          <h2>用户管理</h2>
-          {% if message %}
-          <div class=\"message {{ message_type }}\">{{ message }}</div>
-          {% endif %}
-          <table>
-            <thead>
-              <tr>
-                <th>用户 ID</th>
-                <th>手机号</th>
-                <th>当前类型</th>
-                <th>注册时间</th>
-                <th>操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for user in users %}
-              <tr>
-                <td>{{ user.id }}</td>
-                <td>{{ user.identifier }}</td>
-                <td>{{ user.user_type }}</td>
-                <td>{{ user.created_at }}</td>
-                <td>
-                  <form method=\"post\" class=\"inline\">
-                    <input type=\"hidden\" name=\"action\" value=\"update_user_type\">
-                    <input type=\"hidden\" name=\"user_id\" value=\"{{ user.id }}\">
-                    <select name=\"user_type\">
-                      <option value=\"REGULAR\" {% if user.user_type == 'REGULAR' %}selected{% endif %}>REGULAR</option>
-                      <option value=\"QUIE_STUDENT\" {% if user.user_type == 'QUIE_STUDENT' %}selected{% endif %}>QUIE_STUDENT</option>
-                    </select>
-                    <button type=\"submit\">更新</button>
-                  </form>
-                  <form method=\"post\" class=\"inline\" onsubmit=\"return confirm('确认删除该用户？');\">
-                    <input type=\"hidden\" name=\"action\" value=\"delete_user\">
-                    <input type=\"hidden\" name=\"user_id\" value=\"{{ user.id }}\">
-                    <button type=\"submit\">删除</button>
-                  </form>
-                </td>
-              </tr>
-              {% endfor %}
-            </tbody>
-          </table>
+    <div class="page">
+      <div class="page__inner">
+        <div class="nav-bar">
+          <span>欢迎回来，管理员</span>
+          <a href="{{ url_for('login') }}">返回登录</a>
         </div>
-        <div class=\"card\">
-          <h2>订单列表</h2>
-          <table>
-            <thead>
-              <tr>
-                <th>订单 ID</th>
-                <th>订单编号</th>
-                <th>用户手机号</th>
-                <th>状态</th>
-                <th>总金额</th>
-                <th>创建时间</th>
-                <th>支付时间</th>
-                <th>详情</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for order in orders %}
-              <tr>
-                <td>{{ order.id }}</td>
-                <td>{{ order.order_sn }}</td>
-                <td>{{ order.identifier }}</td>
-                <td>{{ order.status }}</td>
-                <td>￥{{ order.total_amount }}</td>
-                <td>{{ order.created_at }}</td>
-                <td>{{ order.paid_at or '' }}</td>
-                <td>
-                  {% if order.details %}
-                  <ul>
-                    {% for detail in order.details %}
-                    <li>{{ detail.name }} x {{ detail.quantity }} (￥{{ detail.unit_price }})</li>
-                    {% endfor %}
-                  </ul>
-                  {% else %}
-                  无
-                  {% endif %}
-                </td>
-              </tr>
-              {% endfor %}
-            </tbody>
-          </table>
+  <div class="hero hero--nowrap">
+          <span class="hero__badge">Admin Console</span>
+          <h1 class="hero__title">泉州野区大花园 · 订单管理</h1>
+          <p class="hero__subtitle">管理用户类型、订单状态与支付进度，保持运营顺畅。</p>
+        </div>
+        <div class="stats-grid">
+          <div class="stat-card">
+            <span class="stat-card__label">注册用户</span>
+            <span class="stat-card__value">{{ total_users }}</span>
+            <span class="stat-card__meta">{{ student_users }} 位本校学生</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-card__label">订单总数</span>
+            <span class="stat-card__value">{{ total_orders }}</span>
+            <span class="stat-card__meta">待支付 {{ pending_orders }} 单 · 已支付 {{ paid_orders }} 单</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-card__label">已收款</span>
+            <span class="stat-card__value">￥{{ '%.2f'|format(total_revenue) }}</span>
+            <span class="stat-card__meta">平均客单价 ￥{{ '%.2f'|format(avg_ticket_value) }}</span>
+          </div>
+        </div>
+        {% if message %}
+        <div class="alert alert--{{ message_type|default('info') }}">{{ message }}</div>
+        {% endif %}
+        <div class="admin-grid admin-grid--split">
+          <div class="card card--full">
+            <div class="card__header">
+              <h2 class="card__title">用户管理</h2>
+              <span class="card__subtitle">维护用户信息与身份类型</span>
+            </div>
+            {% if users %}
+            <div class="table-container">
+              <table>
+                <thead>
+                  <tr>
+                    <th>用户 ID</th>
+                    <th>手机号</th>
+                    <th>身份类型</th>
+                    <th>注册时间</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for user in users %}
+                  <tr>
+                    <td>{{ user.id }}</td>
+                    <td>{{ user.identifier }}</td>
+                    <td>{{ '泉州本校学生' if user.user_type == 'QUIE_STUDENT' else user.user_type }}</td>
+                    <td>{{ user.created_at }}</td>
+                    <td>
+                      <div class="table-actions">
+                        <form method="post" class="inline-form">
+                          <input type="hidden" name="action" value="update_user_type">
+                          <input type="hidden" name="user_id" value="{{ user.id }}">
+                          <select name="user_type">
+                            <option value="REGULAR" {% if user.user_type == 'REGULAR' %}selected{% endif %}>REGULAR</option>
+                            <option value="QUIE_STUDENT" {% if user.user_type == 'QUIE_STUDENT' %}selected{% endif %}>泉州本校学生</option>
+                          </select>
+                          <button type="submit" class="btn btn--sm btn--ghost">更新</button>
+                        </form>
+                        <form method="post" class="inline-form" onsubmit="return confirm('确认删除该用户？');">
+                          <input type="hidden" name="action" value="delete_user">
+                          <input type="hidden" name="user_id" value="{{ user.id }}">
+                          <button type="submit" class="btn btn--sm btn--danger">删除</button>
+                        </form>
+                      </div>
+                    </td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+            {% else %}
+            <div class="empty-state">暂无用户数据</div>
+            {% endif %}
+          </div>
+          <div class="card card--full">
+            <div class="card__header">
+              <h2 class="card__title">订单列表</h2>
+              <span class="card__subtitle">查看订单详情与票务构成</span>
+            </div>
+            {% if orders %}
+            <div class="table-container">
+              <table>
+                <thead>
+                  <tr>
+                    <th>订单 ID</th>
+                    <th>订单编号</th>
+                    <th>用户手机号</th>
+                    <th>状态</th>
+                    <th>总金额</th>
+                    <th>创建时间</th>
+                    <th>支付时间</th>
+                    <th>详情</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for order in orders %}
+                  <tr>
+                    <td>{{ order.id }}</td>
+                    <td>{{ order.order_sn }}</td>
+                    <td>{{ order.identifier }}</td>
+                    <td>{{ order.status }}</td>
+                    <td>￥{{ order.total_amount }}</td>
+                    <td>{{ order.created_at }}</td>
+                    <td>{{ order.paid_at or '—' }}</td>
+                    <td>
+                      {% if order.details %}
+                      <ul class="detail-list">
+                        {% for detail in order.details %}
+                        <li>{{ detail.name }} x {{ detail.quantity }} (￥{{ detail.unit_price }})</li>
+                        {% endfor %}
+                      </ul>
+                      {% else %}
+                      无
+                      {% endif %}
+                    </td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+            {% else %}
+            <div class="empty-state">暂无订单</div>
+            {% endif %}
+          </div>
+          <div class="card card--wide">
+            <div class="card__header">
+              <h2 class="card__title">运营操作台</h2>
+              <span class="card__subtitle">快速处理线下订单与状态变更</span>
+            </div>
+            <div class="quick-actions">
+              <div class="form-block">
+                <div class="form-block__title">创建订单</div>
+                <p class="form-block__desc">用于现场售票或后台补录。</p>
+                <form method="post" class="form form--dense">
+                  <input type="hidden" name="action" value="create_order">
+                  <div class="form-field">
+                    <label for="user_id">用户 ID</label>
+                    <input type="number" id="user_id" name="user_id" min="1" placeholder="输入用户 ID">
+                  </div>
+                  <div class="form-field">
+                    <label for="ticket_type_id">票种</label>
+                    <select id="ticket_type_id" name="ticket_type_id">
+                      <option value="">选择票种</option>
+                      {% for ticket in ticket_types %}
+                      <option value="{{ ticket.id }}">{{ ticket.name }}</option>
+                      {% endfor %}
+                    </select>
+                  </div>
+                  <div class="form-field">
+                    <label for="quantity">数量</label>
+                    <input type="number" id="quantity" name="quantity" min="1" value="1">
+                  </div>
+                  <div class="card__actions">
+                    <button type="submit">创建订单</button>
+                  </div>
+                </form>
+              </div>
+              <div class="form-block">
+                <div class="form-block__title">更新订单状态</div>
+                <p class="form-block__desc">调整订单流程节点。</p>
+                <form method="post" class="form form--dense">
+                  <input type="hidden" name="action" value="update_order_status">
+                  <div class="form-field">
+                    <label for="order_id_status">订单 ID</label>
+                    <input type="number" id="order_id_status" name="order_id" min="1" placeholder="输入订单 ID">
+                  </div>
+                  <div class="form-field">
+                    <label for="status">订单状态</label>
+                    <select id="status" name="status">
+                      {% for status in status_options %}
+                      <option value="{{ status }}">{{ status }}</option>
+                      {% endfor %}
+                    </select>
+                  </div>
+                  <div class="card__actions">
+                    <button type="submit">更新状态</button>
+                  </div>
+                </form>
+              </div>
+              <div class="form-block">
+                <div class="form-block__title">标记已支付</div>
+                <p class="form-block__desc">确认线下收款后同步状态。</p>
+                <form method="post" class="form form--dense">
+                  <input type="hidden" name="action" value="mark_order_paid">
+                  <div class="form-field">
+                    <label for="order_id_paid">订单 ID</label>
+                    <input type="number" id="order_id_paid" name="order_id" min="1" placeholder="输入订单 ID">
+                  </div>
+                  <div class="card__actions">
+                    <button type="submit">标记为已支付</button>
+                  </div>
+                </form>
+              </div>
+              <div class="form-block">
+                <div class="form-block__title">删除订单</div>
+                <p class="form-block__desc">慎重操作，删除后不可恢复。</p>
+                <form method="post" class="form form--dense" onsubmit="return confirm('确认删除订单？');">
+                  <input type="hidden" name="action" value="delete_order">
+                  <div class="form-field">
+                    <label for="order_id_delete">订单 ID</label>
+                    <input type="number" id="order_id_delete" name="order_id" min="1" placeholder="输入订单 ID">
+                  </div>
+                  <div class="card__actions">
+                    <button type="submit" class="btn btn--danger">删除订单</button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
   </body>
 </html>
 """
- 
+
+
 def create_user(identifier, password, user_type="REGULAR"):
     conn = get_connection()
     cursor = conn.cursor()
@@ -548,34 +556,110 @@ def get_user_type(user_id):
 
 
 def create_order(user_id, selections, total_amount, status="PENDING"):
-  conn = get_connection()
-  cursor = conn.cursor()
-  try:
-    order_sn = uuid.uuid4().hex[:16]
-    cursor.execute(
-      "INSERT INTO orders (order_sn, user_id, status, total_amount) VALUES (%s, %s, %s, %s)",
-      (order_sn, user_id, status, str(total_amount)),
-    )
-    order_id = cursor.lastrowid
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        order_sn = uuid.uuid4().hex[:16]
+        cursor.execute(
+            "INSERT INTO orders (order_sn, user_id, status, total_amount) VALUES (%s, %s, %s, %s)",
+            (order_sn, user_id, status, str(total_amount)),
+        )
+        order_id = cursor.lastrowid
 
-    detail_sql = (
-      "INSERT INTO order_details (order_id, ticket_type_id, quantity, unit_price) "
-      "VALUES (%s, %s, %s, %s)"
-    )
-    for item in selections:
-      cursor.execute(
-        detail_sql,
-        (order_id, item["ticket_type_id"], item["quantity"], str(item["unit_price"])),
-      )
+        detail_sql = (
+            "INSERT INTO order_details (order_id, ticket_type_id, quantity, unit_price) "
+            "VALUES (%s, %s, %s, %s)"
+        )
+        for item in selections:
+            cursor.execute(
+                detail_sql,
+                (order_id, item["ticket_type_id"],
+                 item["quantity"], str(item["unit_price"])),
+            )
 
-    conn.commit()
-    return order_id, order_sn
-  except mysql.connector.Error:
-    conn.rollback()
-    raise
-  finally:
-    cursor.close()
-    conn.close()
+        conn.commit()
+        return order_id, order_sn
+    except mysql.connector.Error:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def update_order_status(order_id, status):
+    if status not in {"PENDING", "COMPLETED", "PAID", "CANCELLED"}:
+        return False
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        if status == "PAID":
+            cursor.execute(
+                "UPDATE orders SET status = %s, paid_at = COALESCE(paid_at, NOW()) WHERE id = %s",
+                (status, order_id),
+            )
+        else:
+            cursor.execute(
+                "UPDATE orders SET status = %s, paid_at = NULL WHERE id = %s",
+                (status, order_id),
+            )
+
+        if cursor.rowcount:
+            conn.commit()
+            return True
+
+        conn.rollback()
+        return False
+    except mysql.connector.Error:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def mark_order_paid(order_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "UPDATE orders SET status = 'PAID', paid_at = COALESCE(paid_at, NOW()) WHERE id = %s",
+            (order_id,),
+        )
+        if cursor.rowcount:
+            conn.commit()
+            return True
+
+        conn.rollback()
+        return False
+    except mysql.connector.Error:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def delete_order(order_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "DELETE FROM order_details WHERE order_id = %s", (order_id,))
+        cursor.execute("DELETE FROM orders WHERE id = %s", (order_id,))
+        if cursor.rowcount:
+            conn.commit()
+            return True
+
+        conn.rollback()
+        return False
+    except mysql.connector.Error:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
 
 
 def update_user_type(user_id, user_type):
@@ -699,7 +783,7 @@ def order():
         ticket_types = [
             ticket
             for ticket in ticket_types
-            if ticket["name"] != "QUIE本校学生票"
+            if ticket["name"] not in STUDENT_TICKET_NAMES
         ]
 
     if request.method == "POST":
@@ -751,76 +835,76 @@ def order():
 
 @app.route("/order/<int:order_id>/summary", methods=["GET"])
 def order_summary(order_id):
-  if "user_id" not in session:
-    return redirect(url_for("login"))
+    if "user_id" not in session:
+        return redirect(url_for("login"))
 
-  order_record = fetch_order_summary(order_id)
-  if not order_record or order_record["user_id"] != session["user_id"]:
-    abort(404)
+    order_record = fetch_order_summary(order_id)
+    if not order_record or order_record["user_id"] != session["user_id"]:
+        abort(404)
 
-  selections = []
-  for item in order_record["details"]:
-    unit_price = Decimal(str(item["unit_price"]))
-    line_total = unit_price * item["quantity"]
-    selections.append(
-      {
-        "name": item["name"],
-        "quantity": item["quantity"],
-        "unit_price": unit_price,
-        "line_total": line_total,
-      }
+    selections = []
+    for item in order_record["details"]:
+        unit_price = Decimal(str(item["unit_price"]))
+        line_total = unit_price * item["quantity"]
+        selections.append(
+            {
+                "name": item["name"],
+                "quantity": item["quantity"],
+                "unit_price": unit_price,
+                "line_total": line_total,
+            }
+        )
+
+    status_message = None
+    status_type = "info"
+    error_code = request.args.get("error")
+    if error_code == "db":
+        status_message = "支付确认失败，请稍后重试。"
+        status_type = "error"
+    elif error_code == "not_found":
+        status_message = "未找到订单，请刷新后重试。"
+        status_type = "error"
+    elif request.args.get("paid") == "1":
+        status_message = "支付成功，订单已完成。"
+        status_type = "success"
+    elif request.args.get("pending") == "1":
+        status_message = "订单已创建，请支付完成后点击“已支付”。"
+
+    is_paid = order_record["status"] == "PAID"
+    total_amount = Decimal(str(order_record["total_amount"]))
+
+    return render_template_string(
+        ORDER_SUCCESS_TEMPLATE,
+        order_sn=order_record["order_sn"],
+        selections=selections,
+        total_amount=total_amount,
+        order_id=order_record["id"],
+        is_paid=is_paid,
+        paid_at=order_record.get("paid_at"),
+        order_status=order_record["status"],
+        status_message=status_message,
+        status_type=status_type,
     )
-
-  status_message = None
-  status_type = "info"
-  error_code = request.args.get("error")
-  if error_code == "db":
-    status_message = "支付确认失败，请稍后重试。"
-    status_type = "error"
-  elif error_code == "not_found":
-    status_message = "未找到订单，请刷新后重试。"
-    status_type = "error"
-  elif request.args.get("paid") == "1":
-    status_message = "支付成功，订单已完成。"
-    status_type = "success"
-  elif request.args.get("pending") == "1":
-    status_message = "订单已创建，请支付完成后点击“已支付”。"
-
-  is_paid = order_record["status"] == "PAID"
-  total_amount = Decimal(str(order_record["total_amount"]))
-
-  return render_template_string(
-    ORDER_SUCCESS_TEMPLATE,
-    order_sn=order_record["order_sn"],
-    selections=selections,
-    total_amount=total_amount,
-    order_id=order_record["id"],
-    is_paid=is_paid,
-    paid_at=order_record.get("paid_at"),
-    order_status=order_record["status"],
-    status_message=status_message,
-    status_type=status_type,
-  )
 
 
 @app.route("/order/<int:order_id>/pay", methods=["POST"])
 def confirm_order_payment(order_id):
-  if "user_id" not in session:
-    return redirect(url_for("login"))
+    if "user_id" not in session:
+        return redirect(url_for("login"))
 
-  order_record = fetch_order_summary(order_id)
-  if not order_record or order_record["user_id"] != session["user_id"]:
-    abort(404)
+    order_record = fetch_order_summary(order_id)
+    if not order_record or order_record["user_id"] != session["user_id"]:
+        abort(404)
 
-  if order_record["status"] == "PAID":
-    return redirect(url_for("order_summary", order_id=order_id, paid="1"))
+    if order_record["status"] == "PAID":
+        return redirect(url_for("order_summary", order_id=order_id, paid="1"))
 
-  try:
-    if mark_order_paid(order_id):
-      return redirect(url_for("order_summary", order_id=order_id, paid="1"))
-    return redirect(url_for("order_summary", order_id=order_id, error="not_found"))
-  except mysql.connector.Error:
-    return redirect(url_for("order_summary", order_id=order_id, error="db"))
+    try:
+        if mark_order_paid(order_id):
+            return redirect(url_for("order_summary", order_id=order_id, paid="1"))
+        return redirect(url_for("order_summary", order_id=order_id, error="not_found"))
+    except mysql.connector.Error:
+        return redirect(url_for("order_summary", order_id=order_id, error="db"))
 
 
 @app.route("/admin", methods=["GET", "POST"])
@@ -970,6 +1054,24 @@ def admin():
     ticket_types = fetch_ticket_types()
     status_options = ["PENDING", "COMPLETED", "PAID", "CANCELLED"]
 
+    total_users = len(users)
+    student_users = sum(1 for user in users if user.get(
+        "user_type") == "QUIE_STUDENT")
+    total_orders = len(orders)
+    pending_orders = sum(
+        1 for order in orders if order.get("status") == "PENDING")
+    paid_orders = sum(1 for order in orders if order.get("status") == "PAID")
+
+    total_revenue = Decimal("0.00")
+    for order in orders:
+        amount = order.get("total_amount")
+        if amount is not None:
+            total_revenue += Decimal(str(amount))
+
+    avg_ticket_value = Decimal("0.00")
+    if total_orders:
+        avg_ticket_value = total_revenue / Decimal(total_orders)
+
     return render_template_string(
         ADMIN_TEMPLATE,
         orders=orders,
@@ -978,6 +1080,13 @@ def admin():
         status_options=status_options,
         message=message,
         message_type=message_type,
+        total_users=total_users,
+        student_users=student_users,
+        total_orders=total_orders,
+        pending_orders=pending_orders,
+        paid_orders=paid_orders,
+        total_revenue=total_revenue,
+        avg_ticket_value=avg_ticket_value,
     )
 
 
@@ -992,134 +1101,34 @@ LOGIN_TEMPLATE = """
 <html lang=\"zh\">
   <head>
     <meta charset=\"utf-8\">
-    <title>登录 - QUIE野区大花园</title>
-    <style>
-      :root {
-        color-scheme: dark;
-      }
-      * {
-        box-sizing: border-box;
-      }
-      body {
-        margin: 0;
-        min-height: 100vh;
-        font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
-        background: radial-gradient(circle at top, #20194d 0%, #0b1220 55%, #05060b 100%);
-        color: #e6edf6;
-      }
-      .wrapper {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        min-height: 100vh;
-        padding: 32px;
-      }
-      .card {
-        width: min(420px, 100%);
-        padding: 36px;
-        border-radius: 24px;
-        background: rgba(15, 23, 42, 0.78);
-        border: 1px solid rgba(148, 163, 184, 0.18);
-        box-shadow: 0 32px 120px rgba(15, 23, 42, 0.75);
-        backdrop-filter: blur(22px);
-      }
-      h1 {
-        margin: 0 0 16px;
-        font-size: 28px;
-        letter-spacing: 0.02em;
-      }
-      .subhead {
-        margin: 0 0 32px;
-        color: #94a3b8;
-        font-size: 15px;
-      }
-      .field {
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
-        margin-bottom: 20px;
-      }
-      label {
-        font-size: 14px;
-        color: #cbd5f5;
-      }
-      input[type="text"],
-      input[type="password"] {
-        width: 100%;
-        padding: 12px 14px;
-        border-radius: 12px;
-        border: 1px solid rgba(148, 163, 184, 0.35);
-        background-color: rgba(15, 23, 42, 0.65);
-        color: inherit;
-        transition: border 0.15s ease, box-shadow 0.15s ease;
-      }
-      input[type="text"]:focus,
-      input[type="password"]:focus {
-        outline: none;
-        border-color: rgba(99, 102, 241, 0.7);
-        box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.25);
-      }
-      button {
-        width: 100%;
-        padding: 12px 16px;
-        border: none;
-        border-radius: 14px;
-        font-size: 15px;
-        font-weight: 600;
-        letter-spacing: 0.01em;
-        color: #0b1220;
-        background: linear-gradient(135deg, #7dd3fc 0%, #60a5fa 45%, #a855f7 100%);
-        cursor: pointer;
-        transition: transform 0.18s ease, box-shadow 0.18s ease;
-      }
-      button:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 18px 50px rgba(96, 165, 250, 0.35);
-      }
-      .alert {
-        margin-bottom: 20px;
-        padding: 12px 14px;
-        border-radius: 12px;
-        background: rgba(239, 68, 68, 0.15);
-        border: 1px solid rgba(239, 68, 68, 0.3);
-        color: #fca5a5;
-        font-size: 14px;
-      }
-      .meta {
-        margin-top: 28px;
-        font-size: 14px;
-        color: #94a3b8;
-        text-align: center;
-      }
-      a {
-        color: #60a5fa;
-        text-decoration: none;
-      }
-      a:hover {
-        text-decoration: underline;
-      }
-    </style>
+    <title>登录 - 泉州野区大花园</title>
+    <link rel=\"stylesheet\" href=\"{{ url_for('static', filename='styles.css') }}\">
   </head>
   <body>
-    <div class=\"wrapper\">
-      <div class=\"card\">
-        <h1>QUIE野区大花园</h1>
-        <p class=\"subhead\">登录以继续管理和购买活动门票</p>
-        {% if error %}
-        <div class=\"alert\">{{ error }}</div>
-        {% endif %}
-        <form method=\"post\">
-          <div class=\"field\">
-            <label for=\"identifier\">手机号</label>
-            <input type=\"text\" id=\"identifier\" name=\"identifier\" required>
-          </div>
-          <div class=\"field\">
-            <label for=\"password\">密码</label>
-            <input type=\"password\" id=\"password\" name=\"password\" required>
-          </div>
-          <button type=\"submit\">立即登录</button>
-        </form>
-        <p class=\"meta\">还没有账号？<a href=\"{{ url_for('signup') }}\">马上注册</a></p>
+    <div class=\"page page--auth\">
+      <div class=\"page__inner\">
+        <div class=\"hero\">
+          <span class=\"hero__badge\">Quanzhou Garden</span>
+          <h1 class=\"hero__title\">泉州野区大花园</h1>
+          <p class=\"hero__subtitle\">登录以继续管理和购买活动门票</p>
+        </div>
+        <div class=\"card card--compact auth-panels\">
+          {% if error %}
+          <div class=\"alert alert--error\">{{ error }}</div>
+          {% endif %}
+          <form method=\"post\" class=\"form\">
+            <div class=\"form-field\">
+              <label for=\"identifier\">手机号</label>
+              <input type=\"text\" id=\"identifier\" name=\"identifier\" required>
+            </div>
+            <div class=\"form-field\">
+              <label for=\"password\">密码</label>
+              <input type=\"password\" id=\"password\" name=\"password\" required>
+            </div>
+            <button type=\"submit\">立即登录</button>
+          </form>
+          <div class=\"meta-text\">还没有账号？<a href=\"{{ url_for('signup') }}\">马上注册</a></div>
+        </div>
       </div>
     </div>
   </body>
@@ -1132,181 +1141,60 @@ SIGNUP_TEMPLATE = """
 <html lang=\"zh\">
   <head>
     <meta charset=\"utf-8\">
-    <title>注册 - QUIE野区大花园</title>
-    <style>
-      :root {
-        color-scheme: dark;
-      }
-      * {
-        box-sizing: border-box;
-      }
-      body {
-        margin: 0;
-        min-height: 100vh;
-        font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
-        background: radial-gradient(circle at 20% -20%, #2f265f 0%, #11152b 55%, #06070d 100%);
-        color: #e6edf6;
-      }
-      .wrapper {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        min-height: 100vh;
-        padding: 32px;
-      }
-      .card {
-        width: min(520px, 100%);
-        padding: 40px;
-        border-radius: 26px;
-        background: rgba(15, 23, 42, 0.78);
-        border: 1px solid rgba(148, 163, 184, 0.18);
-        box-shadow: 0 32px 120px rgba(15, 23, 42, 0.75);
-        backdrop-filter: blur(22px);
-      }
-      h1 {
-        margin: 0 0 12px;
-        font-size: 30px;
-        letter-spacing: 0.02em;
-      }
-      .subhead {
-        margin: 0 0 32px;
-        color: #94a3b8;
-        font-size: 15px;
-      }
-      .field {
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
-        margin-bottom: 20px;
-      }
-      label {
-        font-size: 14px;
-        color: #cbd5f5;
-      }
-      input[type="text"],
-      input[type="password"] {
-        width: 100%;
-        padding: 12px 14px;
-        border-radius: 12px;
-        border: 1px solid rgba(148, 163, 184, 0.35);
-        background-color: rgba(15, 23, 42, 0.65);
-        color: inherit;
-        transition: border 0.15s ease, box-shadow 0.15s ease;
-      }
-      input[type="text"]:focus,
-      input[type="password"]:focus {
-        outline: none;
-        border-color: rgba(99, 102, 241, 0.7);
-        box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.25);
-      }
-      .checkbox {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        margin-bottom: 20px;
-        font-size: 14px;
-        color: #cbd5f5;
-      }
-      input[type="checkbox"] {
-        width: 18px;
-        height: 18px;
-        accent-color: #818cf8;
-      }
-      .student-fields {
-        margin-bottom: 24px;
-        padding: 18px;
-        border-radius: 16px;
-        background: rgba(99, 102, 241, 0.08);
-        border: 1px solid rgba(99, 102, 241, 0.25);
-      }
-      .student-fields small {
-        color: #94a3b8;
-      }
-      button {
-        width: 100%;
-        padding: 12px 16px;
-        border: none;
-        border-radius: 14px;
-        font-size: 15px;
-        font-weight: 600;
-        letter-spacing: 0.01em;
-        color: #0b1220;
-        background: linear-gradient(135deg, #22d3ee 0%, #6366f1 40%, #a855f7 100%);
-        cursor: pointer;
-        transition: transform 0.18s ease, box-shadow 0.18s ease;
-      }
-      button:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 18px 50px rgba(99, 102, 241, 0.35);
-      }
-      .alert {
-        margin-bottom: 20px;
-        padding: 12px 14px;
-        border-radius: 12px;
-        background: rgba(239, 68, 68, 0.13);
-        border: 1px solid rgba(239, 68, 68, 0.26);
-        color: #fca5a5;
-        font-size: 14px;
-      }
-      .meta {
-        margin-top: 28px;
-        font-size: 14px;
-        color: #94a3b8;
-        text-align: center;
-      }
-      a {
-        color: #60a5fa;
-        text-decoration: none;
-      }
-      a:hover {
-        text-decoration: underline;
-      }
-    </style>
+    <title>注册 - 泉州野区大花园</title>
+    <link rel=\"stylesheet\" href=\"{{ url_for('static', filename='styles.css') }}\">
   </head>
   <body>
-    <div class=\"wrapper\">
-      <div class=\"card\">
-        <h1>创建新账号</h1>
-        <p class=\"subhead\">加入 QUIE 野区大花园，探索更多精彩活动</p>
-        {% if error %}
-        <div class=\"alert\">{{ error }}</div>
-        {% endif %}
-        <form method=\"post\">
-          <div class=\"field\">
-            <label for=\"identifier\">手机号</label>
-            <input type=\"text\" id=\"identifier\" name=\"identifier\" value=\"{{ identifier|default('') }}\" required>
-          </div>
-          <div class=\"field\">
-            <label for=\"password\">密码</label>
-            <input type=\"password\" id=\"password\" name=\"password\" required>
-          </div>
-          <label class=\"checkbox\">
-            <input type=\"checkbox\" name=\"is_quie_student\" id=\"is_quie_student\" {{ 'checked' if is_student|default(False) else '' }}>
-            我是 QUIE 本校学生
-          </label>
-          <div id=\"student_fields\" class=\"student-fields\" style=\"{% if not is_student|default(False) %}display: none;{% endif %}\">
-            <div class=\"field\">
-              <label for=\"student_name\">姓名</label>
-              <input type=\"text\" id=\"student_name\" name=\"student_name\" value=\"{{ student_name|default('') }}\">
+    <div class=\"page page--auth\">
+      <div class=\"page__inner\">
+        <div class=\"hero\">
+          <span class=\"hero__badge\">Join Quanzhou Garden</span>
+          <h1 class=\"hero__title\">创建新账号</h1>
+          <p class=\"hero__subtitle\">加入泉州野区大花园，探索更多精彩活动</p>
+        </div>
+        <div class=\"card card--compact auth-panels\">
+          {% if error %}
+          <div class=\"alert alert--error\">{{ error }}</div>
+          {% endif %}
+          <form method=\"post\" class=\"form\">
+            <div class=\"form-field\">
+              <label for=\"identifier\">手机号</label>
+              <input type=\"text\" id=\"identifier\" name=\"identifier\" value=\"{{ identifier|default('') }}\" required>
             </div>
-            <div class=\"field\">
-              <label for=\"student_id\">学号</label>
-              <input type=\"text\" id=\"student_id\" name=\"student_id\" value=\"{{ student_id|default('') }}\">
+            <div class=\"form-field\">
+              <label for=\"password\">密码</label>
+              <input type=\"password\" id=\"password\" name=\"password\" required>
             </div>
-            <small>填写后将进入人工审核流程，系统将优先认定为本校认证。</small>
-          </div>
-          <button type=\"submit\">完成注册</button>
-        </form>
-        <p class=\"meta\">已有账号？<a href=\"{{ url_for('login') }}\">返回登录</a></p>
+            <label class=\"checkbox\" for=\"is_quie_student\">
+              <input type=\"checkbox\" name=\"is_quie_student\" id=\"is_quie_student\" {{ 'checked' if is_student|default(False) else '' }}>
+              我是泉州本校学生
+            </label>
+            <div id=\"student_fields\" class=\"student-fields\" {% if not is_student|default(False) %}style=\"display: none;\"{% endif %}>
+              <div class=\"form-field\">
+                <label for=\"student_name\">姓名</label>
+                <input type=\"text\" id=\"student_name\" name=\"student_name\" value=\"{{ student_name|default('') }}\">
+              </div>
+              <div class=\"form-field\">
+                <label for=\"student_id\">学号</label>
+                <input type=\"text\" id=\"student_id\" name=\"student_id\" value=\"{{ student_id|default('') }}\">
+              </div>
+              <small>填写后将进入人工审核流程，系统将优先认定为本校认证。</small>
+            </div>
+            <button type=\"submit\">完成注册</button>
+          </form>
+          <div class=\"meta-text\">已有账号？<a href=\"{{ url_for('login') }}\">返回登录</a></div>
+        </div>
       </div>
     </div>
     <script>
       const studentCheckbox = document.getElementById('is_quie_student');
       const studentFields = document.getElementById('student_fields');
       if (studentCheckbox && studentFields) {
-        studentCheckbox.addEventListener('change', function () {
-          studentFields.style.display = this.checked ? 'block' : 'none';
-        });
+        const toggleStudentFields = () => {
+          studentFields.style.display = studentCheckbox.checked ? 'grid' : 'none';
+        };
+        toggleStudentFields();
+        studentCheckbox.addEventListener('change', toggleStudentFields);
       }
     </script>
   </body>
@@ -1319,177 +1207,60 @@ ORDER_TEMPLATE = """
 <html lang=\"zh\">
   <head>
     <meta charset=\"utf-8\">
-    <title>购票 - QUIE野区大花园</title>
-    <style>
-      :root {
-        color-scheme: dark;
-      }
-      * {
-        box-sizing: border-box;
-      }
-      body {
-        margin: 0;
-        min-height: 100vh;
-        font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
-        background: radial-gradient(circle at right top, #2c1f59 0%, #0d1324 55%, #05070d 100%);
-        color: #e6edf6;
-      }
-      .wrapper {
-        min-height: 100vh;
-        padding: 48px 32px 64px;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        gap: 32px;
-      }
-      .nav {
-        width: min(1040px, 100%);
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        color: #94a3b8;
-      }
-      .card {
-        width: min(1040px, 100%);
-        padding: 40px;
-        border-radius: 28px;
-        background: rgba(15, 23, 42, 0.78);
-        border: 1px solid rgba(148, 163, 184, 0.16);
-        box-shadow: 0 35px 140px rgba(15, 23, 42, 0.75);
-        backdrop-filter: blur(20px);
-      }
-      h1 {
-        margin: 0 0 12px;
-        font-size: 32px;
-      }
-      .subhead {
-        margin: 0 0 28px;
-        color: #94a3b8;
-        font-size: 15px;
-      }
-      .alert {
-        margin-bottom: 24px;
-        padding: 14px 16px;
-        border-radius: 14px;
-        background: rgba(239, 68, 68, 0.14);
-        border: 1px solid rgba(239, 68, 68, 0.28);
-        color: #fca5a5;
-        font-size: 14px;
-      }
-      .notice {
-        margin-bottom: 24px;
-        padding: 14px 16px;
-        border-radius: 14px;
-        background: rgba(59, 130, 246, 0.12);
-        border: 1px solid rgba(96, 165, 250, 0.25);
-        color: #bfdbfe;
-        font-size: 14px;
-      }
-      table {
-        width: 100%;
-        border-collapse: collapse;
-        border: 1px solid rgba(148, 163, 184, 0.16);
-        border-radius: 18px;
-        overflow: hidden;
-        margin-bottom: 28px;
-        background: rgba(10, 14, 23, 0.55);
-      }
-      th,
-      td {
-        padding: 14px 18px;
-        text-align: left;
-        font-size: 14px;
-      }
-      th {
-        background: rgba(96, 165, 250, 0.12);
-        color: #cbd5f5;
-        font-weight: 600;
-      }
-      tr + tr td {
-        border-top: 1px solid rgba(148, 163, 184, 0.12);
-      }
-      input[type="number"] {
-        width: 100%;
-        max-width: 120px;
-        padding: 10px 12px;
-        border-radius: 12px;
-        border: 1px solid rgba(148, 163, 184, 0.3);
-        background: rgba(15, 23, 42, 0.65);
-        color: inherit;
-        font-size: 14px;
-      }
-      input[type="number"]:focus {
-        outline: none;
-        border-color: rgba(96, 165, 250, 0.65);
-        box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.25);
-      }
-      button {
-        width: 100%;
-        padding: 14px 16px;
-        border: none;
-        border-radius: 16px;
-        font-size: 15px;
-        font-weight: 600;
-        letter-spacing: 0.01em;
-        color: #0b1220;
-        background: linear-gradient(135deg, #38bdf8 0%, #6366f1 45%, #a855f7 100%);
-        cursor: pointer;
-        transition: transform 0.18s ease, box-shadow 0.18s ease;
-      }
-      button:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 22px 70px rgba(99, 102, 241, 0.35);
-      }
-      .link {
-        color: #60a5fa;
-        text-decoration: none;
-      }
-      .link:hover {
-        text-decoration: underline;
-      }
-    </style>
+    <title>购票 - 泉州野区大花园</title>
+    <link rel=\"stylesheet\" href=\"{{ url_for('static', filename='styles.css') }}\">
   </head>
   <body>
-    <div class=\"wrapper\">
-      <div class=\"nav\">
-        <span>当前用户：{{ session['identifier'] }}</span>
-        <a class=\"link\" href=\"{{ url_for('logout') }}\">退出登录</a>
-      </div>
-      <div class=\"card\">
-        <h1>选择票种</h1>
-        {% if user_type|default('REGULAR') != 'QUIE_STUDENT' %}
-        <div class=\"notice\">温馨提示：普通用户无法选择 QUIE 本校学生专属票种。</div>
-        {% else %}
-        <p class=\"subhead\">享受本校学生专属优惠票价。</p>
-        {% endif %}
-        {% if error %}
-        <div class=\"alert\">{{ error }}</div>
-        {% endif %}
-        <form method=\"post\">
-          <table>
-            <thead>
-              <tr>
-                <th>票种</th>
-                <th>价格</th>
-                <th>描述</th>
-                <th style=\"width: 120px;\">数量</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for ticket in ticket_types %}
-              <tr>
-                <td>{{ ticket.name }}</td>
-                <td>￥{{ ticket.price }}</td>
-                <td>{{ ticket.description or '—' }}</td>
-                <td>
-                  <input type=\"number\" min=\"0\" value=\"0\" name=\"{{ ticket.id }}\">
-                </td>
-              </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-          <button type=\"submit\">提交订单</button>
-        </form>
+    <div class=\"page\">
+      <div class=\"page__inner\">
+        <div class=\"nav-bar\">
+          <span>当前用户：{{ session.get('identifier', '访客') }}</span>
+          <a href=\"{{ url_for('logout') }}\">退出登录</a>
+        </div>
+        <div class=\"hero\">
+          <span class=\"hero__badge\">Ticket Center</span>
+          <h1 class=\"hero__title\">选择票种</h1>
+          <p class=\"hero__subtitle\">根据来访身份选择合适票种，确认数量后提交订单。</p>
+        </div>
+        <div class=\"card\">
+          {% if user_type|default('REGULAR') != 'QUIE_STUDENT' %}
+          <div class=\"notice\">温馨提示：普通用户无法选择泉州本校学生专属票种。</div>
+          {% else %}
+          <div class=\"notice\">欢迎本校学生，验证通过后可享受专属票价。</div>
+          {% endif %}
+          {% if error %}
+          <div class=\"alert alert--error\">{{ error }}</div>
+          {% endif %}
+          <form method=\"post\" class=\"form\">
+            <div class=\"table-container\">
+              <table>
+                <thead>
+                  <tr>
+                    <th>票种</th>
+                    <th>价格</th>
+                    <th>描述</th>
+                    <th style=\"width: 120px;\">数量</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for ticket in ticket_types %}
+                  <tr>
+                    <td>{{ ticket.name }}</td>
+                    <td>￥{{ ticket.price }}</td>
+                    <td>{{ ticket.description or '—' }}</td>
+                    <td>
+                      <input type=\"number\" min=\"0\" value=\"0\" name=\"{{ ticket.id }}\">
+                    </td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+            <div class=\"card__actions\">
+              <button type=\"submit\">提交订单</button>
+            </div>
+          </form>
+        </div>
       </div>
     </div>
   </body>
@@ -1502,201 +1273,70 @@ ORDER_SUCCESS_TEMPLATE = """
 <html lang=\"zh\">
   <head>
     <meta charset=\"utf-8\">
-    <title>订单支付确认 - QUIE野区大花园</title>
-    <style>
-      :root {
-        color-scheme: dark;
-      }
-      * {
-        box-sizing: border-box;
-      }
-      body {
-        margin: 0;
-        min-height: 100vh;
-        font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
-        background: radial-gradient(circle at 80% -20%, #2d2a5f 0%, #10162a 55%, #05060d 100%);
-        color: #e6edf6;
-      }
-      .wrapper {
-        min-height: 100vh;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        padding: 48px 32px;
-      }
-      .card {
-        width: min(640px, 100%);
-        padding: 44px;
-        border-radius: 28px;
-        background: rgba(15, 23, 42, 0.78);
-        border: 1px solid rgba(148, 163, 184, 0.18);
-        box-shadow: 0 40px 160px rgba(15, 23, 42, 0.76);
-        backdrop-filter: blur(20px);
-      }
-      h1 {
-        margin: 0 0 12px;
-        font-size: 32px;
-      }
-      .order-sn {
-        margin-bottom: 12px;
-        font-size: 15px;
-        color: #94a3b8;
-      }
-      .status {
-        margin-bottom: 24px;
-        font-size: 14px;
-        color: #cbd5f5;
-      }
-      .flash {
-        margin-bottom: 24px;
-        padding: 14px 16px;
-        border-radius: 16px;
-        font-size: 14px;
-      }
-      .flash.info {
-        background: rgba(59, 130, 246, 0.12);
-        border: 1px solid rgba(96, 165, 250, 0.24);
-        color: #bfdbfe;
-      }
-      .flash.success {
-        background: rgba(34, 197, 94, 0.12);
-        border: 1px solid rgba(34, 197, 94, 0.26);
-        color: #bbf7d0;
-      }
-      .flash.error {
-        background: rgba(239, 68, 68, 0.14);
-        border: 1px solid rgba(239, 68, 68, 0.28);
-        color: #fca5a5;
-      }
-      table {
-        width: 100%;
-        border-collapse: collapse;
-        border-radius: 18px;
-        overflow: hidden;
-        background: rgba(10, 14, 23, 0.55);
-        border: 1px solid rgba(148, 163, 184, 0.16);
-        margin-bottom: 28px;
-      }
-      th,
-      td {
-        padding: 14px 18px;
-        text-align: left;
-        font-size: 14px;
-      }
-      th {
-        background: rgba(96, 165, 250, 0.14);
-        color: #cbd5f5;
-      }
-      tr + tr td {
-        border-top: 1px solid rgba(148, 163, 184, 0.12);
-      }
-      .total {
-        font-size: 18px;
-        font-weight: 600;
-        color: #f8fafc;
-        margin-bottom: 20px;
-      }
-      .meta {
-        margin-bottom: 24px;
-        font-size: 14px;
-        color: #94a3b8;
-      }
-      .actions {
-        display: flex;
-        gap: 14px;
-        flex-wrap: wrap;
-        margin-top: 24px;
-      }
-      .actions form {
-        flex: 1 1 200px;
-      }
-      .btn,
-      .actions button {
-        width: 100%;
-        padding: 14px 16px;
-        border-radius: 16px;
-        text-align: center;
-        font-weight: 600;
-        font-size: 15px;
-        letter-spacing: 0.01em;
-        border: none;
-        color: #0b1220;
-        background: linear-gradient(135deg, #38bdf8 0%, #6366f1 45%, #a855f7 100%);
-        box-shadow: 0 20px 70px rgba(99, 102, 241, 0.32);
-        cursor: pointer;
-        transition: transform 0.18s ease, box-shadow 0.18s ease;
-        text-decoration: none;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-      }
-      .btn:hover,
-      .actions button:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 24px 90px rgba(99, 102, 241, 0.4);
-      }
-      .btn.secondary {
-        background: rgba(148, 163, 184, 0.18);
-        color: #cbd5f5;
-        box-shadow: none;
-      }
-      .btn.secondary:hover {
-        background: rgba(148, 163, 184, 0.3);
-      }
-      .actions .secondary {
-        text-decoration: none;
-      }
-    </style>
+    <title>订单支付确认 - 泉州野区大花园</title>
+    <link rel=\"stylesheet\" href=\"{{ url_for('static', filename='styles.css') }}\">
   </head>
   <body>
-    <div class=\"wrapper\">
-      <div class=\"card\">
-        <h1>订单支付确认</h1>
-        <div class=\"order-sn\">订单号：{{ order_sn }}</div>
-        <div class=\"status\">当前状态：{{ order_status }}</div>
-        {% if paid_at %}
-        <div class=\"meta\">支付时间：{{ paid_at }}</div>
-        {% endif %}
-        {% if status_message %}
-        <div class=\"flash {{ status_type|default('info') }}\">{{ status_message }}</div>
-        {% endif %}
-        <table>
-          <thead>
-            <tr>
-              <th>票种</th>
-              <th>数量</th>
-              <th>单价</th>
-              <th>小计</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for item in selections %}
-            <tr>
-              <td>{{ item.name }}</td>
-              <td>{{ item.quantity }}</td>
-              <td>￥{{ item.unit_price }}</td>
-              <td>￥{{ item.line_total }}</td>
-            </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-        <div class=\"total\">总金额：￥{{ total_amount }}</div>
-        <div class=\"actions\">
-          {% if not is_paid %}
-          <form method=\"post\" action=\"{{ url_for('confirm_order_payment', order_id=order_id) }}\">
-            <button type=\"submit\">已支付</button>
-          </form>
+    <div class=\"page\">
+      <div class=\"page__inner\">
+        <div class=\"nav-bar\">
+          <span>当前用户：{{ session.get('identifier', '访客') }}</span>
+          <a href=\"{{ url_for('logout') }}\">退出登录</a>
+        </div>
+        <div class=\"hero\">
+          <span class=\"hero__badge\">Order Center</span>
+          <h1 class=\"hero__title\">订单支付确认</h1>
+          <p class=\"hero__subtitle\">核对订单详情并完成支付确认。</p>
+        </div>
+        <div class=\"card\">
+          <div class=\"order-summary\">
+            <div>订单号：{{ order_sn }}</div>
+            <div>当前状态：{{ order_status }}</div>
+            {% if paid_at %}
+            <div>支付时间：{{ paid_at }}</div>
+            {% endif %}
+          </div>
+          {% if status_message %}
+          <div class=\"alert alert--{{ status_type|default('info') }}\">{{ status_message }}</div>
           {% endif %}
-          <a class=\"btn\" href=\"{{ url_for('order') }}\">继续购票</a>
-          <a class=\"btn secondary\" href=\"{{ url_for('logout') }}\">退出登录</a>
+          <div class=\"table-container\">
+            <table>
+              <thead>
+                <tr>
+                  <th>票种</th>
+                  <th>数量</th>
+                  <th>单价</th>
+                  <th>小计</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for item in selections %}
+                <tr>
+                  <td>{{ item.name }}</td>
+                  <td>{{ item.quantity }}</td>
+                  <td>￥{{ item.unit_price }}</td>
+                  <td>￥{{ item.line_total }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          <div class=\"total\">总金额：￥{{ total_amount }}</div>
+          <div class=\"actions\">
+            {% if not is_paid %}
+            <form method=\"post\" action=\"{{ url_for('confirm_order_payment', order_id=order_id) }}\">
+              <button type=\"submit\">已支付</button>
+            </form>
+            {% endif %}
+            <a class=\"btn\" href=\"{{ url_for('order') }}\">继续购票</a>
+            <a class=\"btn btn--secondary\" href=\"{{ url_for('logout') }}\">退出登录</a>
+          </div>
         </div>
       </div>
     </div>
   </body>
 </html>
 """
-
-
 
 
 if __name__ == "__main__":
