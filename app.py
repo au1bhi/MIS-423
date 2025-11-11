@@ -1,6 +1,14 @@
 from decimal import Decimal
 
-from flask import Flask, render_template_string, request, redirect, url_for, session, abort
+from flask import (
+    Flask,
+    render_template_string,
+    request,
+    redirect,
+    url_for,
+    session,
+    abort,
+)
 import mysql.connector
 from mysql.connector import pooling
 
@@ -36,6 +44,8 @@ def get_connection():
             **DB_CONFIG,
         )
     return _connection_pool.get_connection()
+
+
 def fetch_ticket_types():
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
@@ -72,8 +82,8 @@ def get_user_by_phone(phone):
     cursor = conn.cursor(dictionary=True)
     try:
         cursor.execute(
-      "SELECT id, user_type, phone, password FROM users WHERE phone = %s",
-      (phone,),
+            "SELECT id, user_type, phone, password FROM users WHERE phone = %s",
+            (phone,),
         )
         return cursor.fetchone()
     finally:
@@ -134,7 +144,7 @@ def fetch_orders_with_details():
                 order = {
                     "id": order_id,
                     "user_id": row["user_id"],
-          "phone": row.get("phone"),
+                    "phone": row.get("phone"),
                     "status": row["status"],
                     "total_amount": row["total_amount"],
                     "created_at": row["created_at"],
@@ -216,237 +226,6 @@ def fetch_order_summary(order_id):
         conn.close()
 
 
-ADMIN_TEMPLATE = """
-<!doctype html>
-<html lang="zh">
-  <head>
-    <meta charset="utf-8">
-    <title>管理后台 - 泉州野区大花园</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
-  </head>
-  <body>
-    <div class="page">
-      <div class="page__inner">
-        <div class="nav-bar">
-          <span>欢迎回来，管理员</span>
-          <a href="{{ url_for('login') }}">返回登录</a>
-        </div>
-  <div class="hero hero--nowrap">
-          <span class="hero__badge">Admin Console</span>
-          <h1 class="hero__title">泉州野区大花园 · 订单管理</h1>
-          <p class="hero__subtitle">管理用户类型、订单状态与支付进度，保持运营顺畅。</p>
-        </div>
-        <div class="stats-grid">
-          <div class="stat-card">
-            <span class="stat-card__label">注册用户</span>
-            <span class="stat-card__value">{{ total_users }}</span>
-            <span class="stat-card__meta">{{ student_users }} 位本校学生</span>
-          </div>
-          <div class="stat-card">
-            <span class="stat-card__label">订单总数</span>
-            <span class="stat-card__value">{{ total_orders }}</span>
-            <span class="stat-card__meta">待支付 {{ pending_orders }} 单 · 已支付 {{ paid_orders }} 单</span>
-          </div>
-          <div class="stat-card">
-            <span class="stat-card__label">已收款</span>
-            <span class="stat-card__value">￥{{ '%.2f'|format(total_revenue) }}</span>
-            <span class="stat-card__meta">平均客单价 ￥{{ '%.2f'|format(avg_ticket_value) }}</span>
-          </div>
-        </div>
-        {% if message %}
-        <div class="alert alert--{{ message_type|default('info') }}">{{ message }}</div>
-        {% endif %}
-        <div class="admin-grid admin-grid--split">
-          <div class="card card--full">
-            <div class="card__header">
-              <h2 class="card__title">用户管理</h2>
-              <span class="card__subtitle">维护用户信息与身份类型</span>
-            </div>
-            {% if users %}
-            <div class="table-container">
-              <table>
-                <thead>
-                  <tr>
-                    <th>用户 ID</th>
-                    <th>手机号</th>
-                    <th>身份类型</th>
-                    <th>注册时间</th>
-                    <th>操作</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {% for user in users %}
-                  <tr>
-                    <td>{{ user.id }}</td>
-                    <td>{{ user.phone }}</td>
-                    <td>{{ '泉州本校学生' if user.user_type == 'QUIE_STUDENT' else user.user_type }}</td>
-                    <td>{{ user.created_at }}</td>
-                    <td>
-                      <div class="table-actions">
-                        <form method="post" class="inline-form">
-                          <input type="hidden" name="action" value="update_user_type">
-                          <input type="hidden" name="user_id" value="{{ user.id }}">
-                          <select name="user_type">
-                            <option value="REGULAR" {% if user.user_type == 'REGULAR' %}selected{% endif %}>REGULAR</option>
-                            <option value="QUIE_STUDENT" {% if user.user_type == 'QUIE_STUDENT' %}selected{% endif %}>泉州本校学生</option>
-                          </select>
-                          <button type="submit" class="btn btn--sm btn--ghost">更新</button>
-                        </form>
-                        <form method="post" class="inline-form" onsubmit="return confirm('确认删除该用户？');">
-                          <input type="hidden" name="action" value="delete_user">
-                          <input type="hidden" name="user_id" value="{{ user.id }}">
-                          <button type="submit" class="btn btn--sm btn--danger">删除</button>
-                        </form>
-                      </div>
-                    </td>
-                  </tr>
-                  {% endfor %}
-                </tbody>
-              </table>
-            </div>
-            {% else %}
-            <div class="empty-state">暂无用户数据</div>
-            {% endif %}
-          </div>
-          <div class="card card--full">
-            <div class="card__header">
-              <h2 class="card__title">订单列表</h2>
-              <span class="card__subtitle">查看订单详情与票务构成</span>
-            </div>
-            {% if orders %}
-            <div class="table-container">
-              <table>
-                <thead>
-                  <tr>
-                    <th>订单 ID</th>
-                    <th>用户手机号</th>
-                    <th>状态</th>
-                    <th>总金额</th>
-                    <th>创建时间</th>
-                    <th>支付时间</th>
-                    <th>详情</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {% for order in orders %}
-                  <tr>
-                    <td>{{ order.id }}</td>
-                    <td>{{ order.phone }}</td>
-                    <td>{{ order.status }}</td>
-                    <td>￥{{ order.total_amount }}</td>
-                    <td>{{ order.created_at }}</td>
-                    <td>{{ order.paid_at or '—' }}</td>
-                    <td>
-                      {% if order.details %}
-                      <ul class="detail-list">
-                        {% for detail in order.details %}
-                        <li>{{ detail.name }} x {{ detail.quantity }} (￥{{ detail.unit_price }})</li>
-                        {% endfor %}
-                      </ul>
-                      {% else %}
-                      无
-                      {% endif %}
-                    </td>
-                  </tr>
-                  {% endfor %}
-                </tbody>
-              </table>
-            </div>
-            {% else %}
-            <div class="empty-state">暂无订单</div>
-            {% endif %}
-          </div>
-          <div class="card card--wide">
-            <div class="card__header">
-              <h2 class="card__title">运营操作台</h2>
-              <span class="card__subtitle">快速处理线下订单与状态变更</span>
-            </div>
-            <div class="quick-actions">
-              <div class="form-block">
-                <div class="form-block__title">创建订单</div>
-                <p class="form-block__desc">用于现场售票或后台补录。</p>
-                <form method="post" class="form form--dense">
-                  <input type="hidden" name="action" value="create_order">
-                  <div class="form-field">
-                    <label for="user_id">用户 ID</label>
-                    <input type="number" id="user_id" name="user_id" min="1" placeholder="输入用户 ID">
-                  </div>
-                  <div class="form-field">
-                    <label for="ticket_type_id">票种</label>
-                    <select id="ticket_type_id" name="ticket_type_id">
-                      <option value="">选择票种</option>
-                      {% for ticket in ticket_types %}
-                      <option value="{{ ticket.id }}">{{ ticket.name }}</option>
-                      {% endfor %}
-                    </select>
-                  </div>
-                  <div class="form-field">
-                    <label for="quantity">数量</label>
-                    <input type="number" id="quantity" name="quantity" min="1" value="1">
-                  </div>
-                  <div class="card__actions">
-                    <button type="submit">创建订单</button>
-                  </div>
-                </form>
-              </div>
-              <div class="form-block">
-                <div class="form-block__title">更新订单状态</div>
-                <p class="form-block__desc">调整订单流程节点。</p>
-                <form method="post" class="form form--dense">
-                  <input type="hidden" name="action" value="update_order_status">
-                  <div class="form-field">
-                    <label for="order_id_status">订单 ID</label>
-                    <input type="number" id="order_id_status" name="order_id" min="1" placeholder="输入订单 ID">
-                  </div>
-                  <div class="form-field">
-                    <label for="status">订单状态</label>
-                    <select id="status" name="status">
-                      {% for status in status_options %}
-                      <option value="{{ status }}">{{ status }}</option>
-                      {% endfor %}
-                    </select>
-                  </div>
-                  <div class="card__actions">
-                    <button type="submit">更新状态</button>
-                  </div>
-                </form>
-              </div>
-              <div class="form-block">
-                <div class="form-block__title">标记已支付</div>
-                <p class="form-block__desc">确认线下收款后同步状态。</p>
-                <form method="post" class="form form--dense">
-                  <input type="hidden" name="action" value="mark_order_paid">
-                  <div class="form-field">
-                    <label for="order_id_paid">订单 ID</label>
-                    <input type="number" id="order_id_paid" name="order_id" min="1" placeholder="输入订单 ID">
-                  </div>
-                  <div class="card__actions">
-                    <button type="submit">标记为已支付</button>
-                  </div>
-                </form>
-              </div>
-              <div class="form-block">
-                <div class="form-block__title">删除订单</div>
-                <p class="form-block__desc">慎重操作，删除后不可恢复。</p>
-                <form method="post" class="form form--dense" onsubmit="return confirm('确认删除订单？');">
-                  <input type="hidden" name="action" value="delete_order">
-                  <div class="form-field">
-                    <label for="order_id_delete">订单 ID</label>
-                    <input type="number" id="order_id_delete" name="order_id" min="1" placeholder="输入订单 ID">
-                  </div>
-                  <div class="card__actions">
-                    <button type="submit" class="btn btn--danger">删除订单</button>
-                  </div>
-                </form>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </body>
-</html>
-"""
 
 
 def create_user(phone, password, user_type="REGULAR"):
@@ -492,12 +271,12 @@ def create_order(user_id, selections, total_amount, status="PENDING"):
         for item in selections:
             cursor.execute(
                 detail_sql,
-        (
-          order_id,
-          item["ticket_type_id"],
-          item["quantity"],
-          str(item["unit_price"]),
-        ),
+                (
+                    order_id,
+                    item["ticket_type_id"],
+                    item["quantity"],
+                    str(item["unit_price"]),
+                ),
             )
 
         conn.commit()
@@ -568,8 +347,7 @@ def delete_order(order_id):
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute(
-            "DELETE FROM order_details WHERE order_id = %s", (order_id,))
+        cursor.execute("DELETE FROM order_details WHERE order_id = %s", (order_id,))
         cursor.execute("DELETE FROM orders WHERE id = %s", (order_id,))
         if cursor.rowcount:
             conn.commit()
@@ -623,6 +401,8 @@ def delete_user_and_orders(user_id):
     finally:
         cursor.close()
         conn.close()
+
+
 @app.route("/signup", methods=["GET", "POST"])
 def signup():
     if request.method == "POST":
@@ -977,11 +757,9 @@ def admin():
     status_options = ["PENDING", "COMPLETED", "PAID", "CANCELLED"]
 
     total_users = len(users)
-    student_users = sum(1 for user in users if user.get(
-        "user_type") == "QUIE_STUDENT")
+    student_users = sum(1 for user in users if user.get("user_type") == "QUIE_STUDENT")
     total_orders = len(orders)
-    pending_orders = sum(
-        1 for order in orders if order.get("status") == "PENDING")
+    pending_orders = sum(1 for order in orders if order.get("status") == "PENDING")
     paid_orders = sum(1 for order in orders if order.get("status") == "PAID")
 
     total_revenue = Decimal("0.00")
@@ -1260,6 +1038,237 @@ ORDER_SUCCESS_TEMPLATE = """
 </html>
 """
 
+ADMIN_TEMPLATE = """
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8">
+    <title>管理后台 - 泉州野区大花园</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  </head>
+  <body>
+    <div class="page">
+      <div class="page__inner">
+        <div class="nav-bar">
+          <span>欢迎回来，管理员</span>
+          <a href="{{ url_for('login') }}">返回登录</a>
+        </div>
+  <div class="hero hero--nowrap">
+          <span class="hero__badge">Admin Console</span>
+          <h1 class="hero__title">泉州野区大花园 · 订单管理</h1>
+          <p class="hero__subtitle">管理用户类型、订单状态与支付进度，保持运营顺畅。</p>
+        </div>
+        <div class="stats-grid">
+          <div class="stat-card">
+            <span class="stat-card__label">注册用户</span>
+            <span class="stat-card__value">{{ total_users }}</span>
+            <span class="stat-card__meta">{{ student_users }} 位本校学生</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-card__label">订单总数</span>
+            <span class="stat-card__value">{{ total_orders }}</span>
+            <span class="stat-card__meta">待支付 {{ pending_orders }} 单 · 已支付 {{ paid_orders }} 单</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-card__label">已收款</span>
+            <span class="stat-card__value">￥{{ '%.2f'|format(total_revenue) }}</span>
+            <span class="stat-card__meta">平均客单价 ￥{{ '%.2f'|format(avg_ticket_value) }}</span>
+          </div>
+        </div>
+        {% if message %}
+        <div class="alert alert--{{ message_type|default('info') }}">{{ message }}</div>
+        {% endif %}
+        <div class="admin-grid admin-grid--split">
+          <div class="card card--full">
+            <div class="card__header">
+              <h2 class="card__title">用户管理</h2>
+              <span class="card__subtitle">维护用户信息与身份类型</span>
+            </div>
+            {% if users %}
+            <div class="table-container">
+              <table>
+                <thead>
+                  <tr>
+                    <th>用户 ID</th>
+                    <th>手机号</th>
+                    <th>身份类型</th>
+                    <th>注册时间</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for user in users %}
+                  <tr>
+                    <td>{{ user.id }}</td>
+                    <td>{{ user.phone }}</td>
+                    <td>{{ '泉州本校学生' if user.user_type == 'QUIE_STUDENT' else user.user_type }}</td>
+                    <td>{{ user.created_at }}</td>
+                    <td>
+                      <div class="table-actions">
+                        <form method="post" class="inline-form">
+                          <input type="hidden" name="action" value="update_user_type">
+                          <input type="hidden" name="user_id" value="{{ user.id }}">
+                          <select name="user_type">
+                            <option value="REGULAR" {% if user.user_type == 'REGULAR' %}selected{% endif %}>REGULAR</option>
+                            <option value="QUIE_STUDENT" {% if user.user_type == 'QUIE_STUDENT' %}selected{% endif %}>泉州本校学生</option>
+                          </select>
+                          <button type="submit" class="btn btn--sm btn--ghost">更新</button>
+                        </form>
+                        <form method="post" class="inline-form" onsubmit="return confirm('确认删除该用户？');">
+                          <input type="hidden" name="action" value="delete_user">
+                          <input type="hidden" name="user_id" value="{{ user.id }}">
+                          <button type="submit" class="btn btn--sm btn--danger">删除</button>
+                        </form>
+                      </div>
+                    </td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+            {% else %}
+            <div class="empty-state">暂无用户数据</div>
+            {% endif %}
+          </div>
+          <div class="card card--full">
+            <div class="card__header">
+              <h2 class="card__title">订单列表</h2>
+              <span class="card__subtitle">查看订单详情与票务构成</span>
+            </div>
+            {% if orders %}
+            <div class="table-container">
+              <table>
+                <thead>
+                  <tr>
+                    <th>订单 ID</th>
+                    <th>用户手机号</th>
+                    <th>状态</th>
+                    <th>总金额</th>
+                    <th>创建时间</th>
+                    <th>支付时间</th>
+                    <th>详情</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for order in orders %}
+                  <tr>
+                    <td>{{ order.id }}</td>
+                    <td>{{ order.phone }}</td>
+                    <td>{{ order.status }}</td>
+                    <td>￥{{ order.total_amount }}</td>
+                    <td>{{ order.created_at }}</td>
+                    <td>{{ order.paid_at or '—' }}</td>
+                    <td>
+                      {% if order.details %}
+                      <ul class="detail-list">
+                        {% for detail in order.details %}
+                        <li>{{ detail.name }} x {{ detail.quantity }} (￥{{ detail.unit_price }})</li>
+                        {% endfor %}
+                      </ul>
+                      {% else %}
+                      无
+                      {% endif %}
+                    </td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+            {% else %}
+            <div class="empty-state">暂无订单</div>
+            {% endif %}
+          </div>
+          <div class="card card--wide">
+            <div class="card__header">
+              <h2 class="card__title">运营操作台</h2>
+              <span class="card__subtitle">快速处理线下订单与状态变更</span>
+            </div>
+            <div class="quick-actions">
+              <div class="form-block">
+                <div class="form-block__title">创建订单</div>
+                <p class="form-block__desc">用于现场售票或后台补录。</p>
+                <form method="post" class="form form--dense">
+                  <input type="hidden" name="action" value="create_order">
+                  <div class="form-field">
+                    <label for="user_id">用户 ID</label>
+                    <input type="number" id="user_id" name="user_id" min="1" placeholder="输入用户 ID">
+                  </div>
+                  <div class="form-field">
+                    <label for="ticket_type_id">票种</label>
+                    <select id="ticket_type_id" name="ticket_type_id">
+                      <option value="">选择票种</option>
+                      {% for ticket in ticket_types %}
+                      <option value="{{ ticket.id }}">{{ ticket.name }}</option>
+                      {% endfor %}
+                    </select>
+                  </div>
+                  <div class="form-field">
+                    <label for="quantity">数量</label>
+                    <input type="number" id="quantity" name="quantity" min="1" value="1">
+                  </div>
+                  <div class="card__actions">
+                    <button type="submit">创建订单</button>
+                  </div>
+                </form>
+              </div>
+              <div class="form-block">
+                <div class="form-block__title">更新订单状态</div>
+                <p class="form-block__desc">调整订单流程节点。</p>
+                <form method="post" class="form form--dense">
+                  <input type="hidden" name="action" value="update_order_status">
+                  <div class="form-field">
+                    <label for="order_id_status">订单 ID</label>
+                    <input type="number" id="order_id_status" name="order_id" min="1" placeholder="输入订单 ID">
+                  </div>
+                  <div class="form-field">
+                    <label for="status">订单状态</label>
+                    <select id="status" name="status">
+                      {% for status in status_options %}
+                      <option value="{{ status }}">{{ status }}</option>
+                      {% endfor %}
+                    </select>
+                  </div>
+                  <div class="card__actions">
+                    <button type="submit">更新状态</button>
+                  </div>
+                </form>
+              </div>
+              <div class="form-block">
+                <div class="form-block__title">标记已支付</div>
+                <p class="form-block__desc">确认线下收款后同步状态。</p>
+                <form method="post" class="form form--dense">
+                  <input type="hidden" name="action" value="mark_order_paid">
+                  <div class="form-field">
+                    <label for="order_id_paid">订单 ID</label>
+                    <input type="number" id="order_id_paid" name="order_id" min="1" placeholder="输入订单 ID">
+                  </div>
+                  <div class="card__actions">
+                    <button type="submit">标记为已支付</button>
+                  </div>
+                </form>
+              </div>
+              <div class="form-block">
+                <div class="form-block__title">删除订单</div>
+                <p class="form-block__desc">慎重操作，删除后不可恢复。</p>
+                <form method="post" class="form form--dense" onsubmit="return confirm('确认删除订单？');">
+                  <input type="hidden" name="action" value="delete_order">
+                  <div class="form-field">
+                    <label for="order_id_delete">订单 ID</label>
+                    <input type="number" id="order_id_delete" name="order_id" min="1" placeholder="输入订单 ID">
+                  </div>
+                  <div class="card__actions">
+                    <button type="submit" class="btn btn--danger">删除订单</button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
+"""
 
 if __name__ == "__main__":
     app.run(debug=True)

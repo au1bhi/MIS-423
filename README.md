@@ -24,12 +24,18 @@ MIS-423/
 
 1. Create and configure a MySQL database using the statements in `database.sql`.
 2. Update `DB_CONFIG` inside `app.py` if your local database settings differ.
-3. Install the required Python packages (Flask and mysql-connector-python).
+3. (Recommended) Create a virtual environment and install dependencies:
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate
+   ```
 4. Launch the Flask development server:
    ```bash
    python app.py
    ```
 5. Access the application via `http://localhost:5000` for demonstration.
+6. Use the `/admin` route with an administrator account to review users, orders, and perform maintenance tasks (update user type, create orders, adjust status, mark paid, delete records).
+
 
 Remember: this project supports the MIS-423 coursework and should not be repurposed for live deployments.
 
@@ -61,11 +67,17 @@ MIS-423/
 
 1. 使用 `database.sql` 创建并初始化 MySQL 数据库。
 2. 如果本地数据库配置不同，请在 `app.py` 中调整 `DB_CONFIG`。
-3. 安装依赖库（Flask、mysql-connector-python 等）。
+3. 建议创建虚拟环境并安装依赖：
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate
+   ```
 4. 在命令行运行：
    ```bash
    python app.py
    ```
 5. 在浏览器访问 `http://localhost:5000` 测试示例功能。
+6. 管理后台位于 `/admin`，可在此查看用户、订单并执行更新、创建、标记支付或删除等操作。
+
 
 请注意：本项目仅为 MIS-423 课程教学示例，不建议用于任何真实生产场景。
