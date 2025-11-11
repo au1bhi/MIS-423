@@ -35,9 +35,9 @@ Remember: this project supports the MIS-423 coursework and should not be repurpo
 
 ---
 
-# MIS-423 课程示例（中文说明）
+# MIS-423
 
-本仓库是 MIS-423 课程中用于演示数据库设计的 Flask 示例应用，仅供课堂教学参考。
+本仓库是 MIS-423 课程中用于演示数据库设计的 Flask 示例应用，仅供教学参考。
 
 ## 重要提示
 
