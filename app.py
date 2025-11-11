@@ -1,4 +1,3 @@
-import uuid
 from decimal import Decimal
 
 from flask import Flask, render_template_string, request, redirect, url_for, session, abort
@@ -7,7 +6,7 @@ from mysql.connector import pooling
 
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
-app.secret_key = "replace-with-a-secret-key"
+app.secret_key = "Just for MySQL in MIS - 423"
 
 DB_CONFIG = {
     "host": "localhost",
@@ -37,78 +36,6 @@ def get_connection():
             **DB_CONFIG,
         )
     return _connection_pool.get_connection()
-
-
-def ensure_password_column():
-    conn = get_connection()
-    cursor = conn.cursor()
-    altered = False
-    try:
-        cursor.execute("SHOW COLUMNS FROM users LIKE 'password'")
-        if cursor.fetchone() is None:
-            cursor.execute(
-                "ALTER TABLE users ADD COLUMN password VARCHAR(255) NOT NULL DEFAULT '' AFTER identifier"
-            )
-            altered = True
-        if altered:
-            conn.commit()
-    except mysql.connector.Error:
-        conn.rollback()
-        raise
-    finally:
-        cursor.close()
-        conn.close()
-
-
-def ensure_order_status_columns():
-    conn = get_connection()
-    cursor = conn.cursor()
-    altered = False
-    try:
-        cursor.execute("SHOW COLUMNS FROM orders LIKE 'status'")
-        status_column = cursor.fetchone()
-        desired_enum = "ENUM('PENDING','COMPLETED','PAID','CANCELLED')"
-        if status_column is None:
-            cursor.execute(
-                "ALTER TABLE orders ADD COLUMN status "
-                + desired_enum
-                + " NOT NULL DEFAULT 'PENDING' AFTER user_id"
-            )
-            altered = True
-        else:
-            column_type = status_column[1]
-            if "enum" in column_type.lower() and "PENDING" not in column_type:
-                cursor.execute(
-                    "ALTER TABLE orders MODIFY status "
-                    + desired_enum
-                    + " NOT NULL DEFAULT 'PENDING'"
-                )
-                altered = True
-
-        cursor.execute("SHOW COLUMNS FROM orders LIKE 'paid_at'")
-        if cursor.fetchone() is None:
-            cursor.execute(
-                "ALTER TABLE orders ADD COLUMN paid_at DATETIME NULL AFTER total_amount")
-            altered = True
-
-        cursor.execute("SHOW COLUMNS FROM orders LIKE 'order_sn'")
-        if cursor.fetchone() is None:
-            cursor.execute(
-                "ALTER TABLE orders ADD COLUMN order_sn VARCHAR(64) NOT NULL AFTER id")
-            cursor.execute(
-                "CREATE UNIQUE INDEX idx_orders_sn ON orders(order_sn)")
-            altered = True
-
-        if altered:
-            conn.commit()
-    except mysql.connector.Error:
-        conn.rollback()
-        raise
-    finally:
-        cursor.close()
-        conn.close()
-
-
 def fetch_ticket_types():
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
@@ -117,7 +44,6 @@ def fetch_ticket_types():
             """
       SELECT id, name, price, description
       FROM ticket_types
-      WHERE is_active = 1
       ORDER BY id
       """
         )
@@ -141,13 +67,13 @@ def get_ticket_type(ticket_type_id):
         conn.close()
 
 
-def get_user_by_identifier(identifier):
+def get_user_by_phone(phone):
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
     try:
         cursor.execute(
-            "SELECT id, user_type, identifier, password FROM users WHERE identifier = %s",
-            (identifier,),
+      "SELECT id, user_type, phone, password FROM users WHERE phone = %s",
+      (phone,),
         )
         return cursor.fetchone()
     finally:
@@ -161,7 +87,7 @@ def fetch_users():
     try:
         cursor.execute(
             """
-      SELECT id, user_type, identifier, created_at
+    SELECT id, user_type, phone, created_at
       FROM users
       ORDER BY created_at DESC
       """
@@ -180,9 +106,8 @@ def fetch_orders_with_details():
             """
       SELECT
         o.id,
-        o.order_sn,
         o.user_id,
-        u.identifier,
+        u.phone,
         o.status,
         o.total_amount,
         o.created_at,
@@ -208,9 +133,8 @@ def fetch_orders_with_details():
             if order is None:
                 order = {
                     "id": order_id,
-                    "order_sn": row["order_sn"],
                     "user_id": row["user_id"],
-                    "identifier": row.get("identifier"),
+          "phone": row.get("phone"),
                     "status": row["status"],
                     "total_amount": row["total_amount"],
                     "created_at": row["created_at"],
@@ -242,7 +166,6 @@ def fetch_order_summary(order_id):
             """
       SELECT
         o.id,
-        o.order_sn,
         o.user_id,
         o.status,
         o.total_amount,
@@ -268,7 +191,6 @@ def fetch_order_summary(order_id):
         header = rows[0]
         order = {
             "id": header["id"],
-            "order_sn": header["order_sn"],
             "user_id": header["user_id"],
             "status": header["status"],
             "total_amount": header["total_amount"],
@@ -356,7 +278,7 @@ ADMIN_TEMPLATE = """
                   {% for user in users %}
                   <tr>
                     <td>{{ user.id }}</td>
-                    <td>{{ user.identifier }}</td>
+                    <td>{{ user.phone }}</td>
                     <td>{{ '泉州本校学生' if user.user_type == 'QUIE_STUDENT' else user.user_type }}</td>
                     <td>{{ user.created_at }}</td>
                     <td>
@@ -397,7 +319,6 @@ ADMIN_TEMPLATE = """
                 <thead>
                   <tr>
                     <th>订单 ID</th>
-                    <th>订单编号</th>
                     <th>用户手机号</th>
                     <th>状态</th>
                     <th>总金额</th>
@@ -410,8 +331,7 @@ ADMIN_TEMPLATE = """
                   {% for order in orders %}
                   <tr>
                     <td>{{ order.id }}</td>
-                    <td>{{ order.order_sn }}</td>
-                    <td>{{ order.identifier }}</td>
+                    <td>{{ order.phone }}</td>
                     <td>{{ order.status }}</td>
                     <td>￥{{ order.total_amount }}</td>
                     <td>{{ order.created_at }}</td>
@@ -529,13 +449,13 @@ ADMIN_TEMPLATE = """
 """
 
 
-def create_user(identifier, password, user_type="REGULAR"):
+def create_user(phone, password, user_type="REGULAR"):
     conn = get_connection()
     cursor = conn.cursor()
     try:
         cursor.execute(
-            "INSERT INTO users (user_type, identifier, password) VALUES (%s, %s, %s)",
-            (user_type, identifier, password),
+            "INSERT INTO users (user_type, phone, password) VALUES (%s, %s, %s)",
+            (user_type, phone, password),
         )
         conn.commit()
     finally:
@@ -559,10 +479,9 @@ def create_order(user_id, selections, total_amount, status="PENDING"):
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        order_sn = uuid.uuid4().hex[:16]
         cursor.execute(
-            "INSERT INTO orders (order_sn, user_id, status, total_amount) VALUES (%s, %s, %s, %s)",
-            (order_sn, user_id, status, str(total_amount)),
+            "INSERT INTO orders (user_id, status, total_amount) VALUES (%s, %s, %s)",
+            (user_id, status, str(total_amount)),
         )
         order_id = cursor.lastrowid
 
@@ -573,12 +492,16 @@ def create_order(user_id, selections, total_amount, status="PENDING"):
         for item in selections:
             cursor.execute(
                 detail_sql,
-                (order_id, item["ticket_type_id"],
-                 item["quantity"], str(item["unit_price"])),
+        (
+          order_id,
+          item["ticket_type_id"],
+          item["quantity"],
+          str(item["unit_price"]),
+        ),
             )
 
         conn.commit()
-        return order_id, order_sn
+        return order_id
     except mysql.connector.Error:
         conn.rollback()
         raise
@@ -700,29 +623,23 @@ def delete_user_and_orders(user_id):
     finally:
         cursor.close()
         conn.close()
-
-
-ensure_password_column()
-ensure_order_status_columns()
-
-
 @app.route("/signup", methods=["GET", "POST"])
 def signup():
     if request.method == "POST":
-        identifier = request.form.get("identifier", "").strip()
+        phone = request.form.get("phone", "").strip()
         password = request.form.get("password", "")
         is_student = request.form.get("is_quie_student") == "on"
         student_id = request.form.get("student_id", "").strip()
         student_name = request.form.get("student_name", "").strip()
 
         context = {
-            "identifier": identifier,
+            "phone": phone,
             "is_student": is_student,
             "student_id": student_id,
             "student_name": student_name,
         }
 
-        if not identifier or not password:
+        if not phone or not password:
             return render_template_string(
                 SIGNUP_TEMPLATE,
                 error="手机号和密码均不能为空",
@@ -736,7 +653,7 @@ def signup():
                 **context,
             )
 
-        if get_user_by_identifier(identifier):
+        if get_user_by_phone(phone):
             return render_template_string(
                 SIGNUP_TEMPLATE,
                 error="该手机号已注册",
@@ -744,7 +661,7 @@ def signup():
             )
 
         user_type = "QUIE_STUDENT" if is_student else "REGULAR"
-        create_user(identifier, password, user_type=user_type)
+        create_user(phone, password, user_type=user_type)
         return redirect(url_for("login"))
 
     return render_template_string(SIGNUP_TEMPLATE)
@@ -755,13 +672,13 @@ def signup():
 def login():
     error = None
     if request.method == "POST":
-        identifier = request.form.get("identifier", "").strip()
+        phone = request.form.get("phone", "").strip()
         password = request.form.get("password", "")
 
-        user = get_user_by_identifier(identifier)
+        user = get_user_by_phone(phone)
         if user and user["password"] == password:
             session["user_id"] = user["id"]
-            session["identifier"] = user["identifier"]
+            session["phone"] = user["phone"]
             session["user_type"] = user.get("user_type")
             return redirect(url_for("order"))
 
@@ -819,7 +736,7 @@ def order():
                 user_type=user_type,
             )
 
-        order_id, _order_sn = create_order(
+        order_id = create_order(
             session["user_id"],
             selections,
             total_amount,
@@ -875,7 +792,6 @@ def order_summary(order_id):
 
     return render_template_string(
         ORDER_SUCCESS_TEMPLATE,
-        order_sn=order_record["order_sn"],
         selections=selections,
         total_amount=total_amount,
         order_id=order_record["id"],
@@ -961,38 +877,44 @@ def admin():
                     quantity = int(quantity_raw) if quantity_raw else 0
                 except ValueError:
                     quantity = 0
+
                 if quantity <= 0:
                     message = "数量必须大于 0"
                     message_type = "error"
                 else:
-                    ticket = get_ticket_type(int(ticket_type_raw))
-                    if not ticket:
-                        message = "未找到所选票种"
+                    existing_user_type = get_user_type(int(user_id_raw))
+                    if existing_user_type is None:
+                        message = "未找到对应的用户"
                         message_type = "error"
                     else:
-                        try:
-                            unit_price = Decimal(str(ticket["price"]))
-                            line_total = unit_price * quantity
-                            selections = [
-                                {
-                                    "ticket_type_id": ticket["id"],
-                                    "name": ticket["name"],
-                                    "quantity": quantity,
-                                    "unit_price": unit_price,
-                                    "line_total": line_total,
-                                }
-                            ]
-                            _order_id, _order_sn = create_order(
-                                int(user_id_raw),
-                                selections,
-                                line_total,
-                                status="PENDING",
-                            )
-                            message = "订单已创建"
-                            message_type = "success"
-                        except mysql.connector.Error as exc:
-                            message = f"创建订单失败：{exc.msg}"
+                        ticket = get_ticket_type(int(ticket_type_raw))
+                        if not ticket:
+                            message = "未找到所选票种"
                             message_type = "error"
+                        else:
+                            try:
+                                unit_price = Decimal(str(ticket["price"]))
+                                line_total = unit_price * quantity
+                                selections = [
+                                    {
+                                        "ticket_type_id": ticket["id"],
+                                        "name": ticket["name"],
+                                        "quantity": quantity,
+                                        "unit_price": unit_price,
+                                        "line_total": line_total,
+                                    }
+                                ]
+                                create_order(
+                                    int(user_id_raw),
+                                    selections,
+                                    line_total,
+                                    status="PENDING",
+                                )
+                                message = "订单已创建"
+                                message_type = "success"
+                            except mysql.connector.Error as exc:
+                                message = f"创建订单失败：{exc.msg}"
+                                message_type = "error"
             else:
                 message = "请选择有效的用户和票种"
                 message_type = "error"
@@ -1118,8 +1040,8 @@ LOGIN_TEMPLATE = """
           {% endif %}
           <form method=\"post\" class=\"form\">
             <div class=\"form-field\">
-              <label for=\"identifier\">手机号</label>
-              <input type=\"text\" id=\"identifier\" name=\"identifier\" required>
+              <label for=\"phone\">手机号</label>
+              <input type=\"text\" id=\"phone\" name=\"phone\" required>
             </div>
             <div class=\"form-field\">
               <label for=\"password\">密码</label>
@@ -1158,8 +1080,8 @@ SIGNUP_TEMPLATE = """
           {% endif %}
           <form method=\"post\" class=\"form\">
             <div class=\"form-field\">
-              <label for=\"identifier\">手机号</label>
-              <input type=\"text\" id=\"identifier\" name=\"identifier\" value=\"{{ identifier|default('') }}\" required>
+              <label for=\"phone\">手机号</label>
+              <input type=\"text\" id=\"phone\" name=\"phone\" value=\"{{ phone|default('') }}\" required>
             </div>
             <div class=\"form-field\">
               <label for=\"password\">密码</label>
@@ -1167,7 +1089,7 @@ SIGNUP_TEMPLATE = """
             </div>
             <label class=\"checkbox\" for=\"is_quie_student\">
               <input type=\"checkbox\" name=\"is_quie_student\" id=\"is_quie_student\" {{ 'checked' if is_student|default(False) else '' }}>
-              我是泉州本校学生
+              我是QUIE本校学生
             </label>
             <div id=\"student_fields\" class=\"student-fields\" {% if not is_student|default(False) %}style=\"display: none;\"{% endif %}>
               <div class=\"form-field\">
@@ -1178,7 +1100,7 @@ SIGNUP_TEMPLATE = """
                 <label for=\"student_id\">学号</label>
                 <input type=\"text\" id=\"student_id\" name=\"student_id\" value=\"{{ student_id|default('') }}\">
               </div>
-              <small>填写后将进入人工审核流程，系统将优先认定为本校认证。</small>
+              <small>由于项目仅供运行数据库，暂不做验证。</small>
             </div>
             <button type=\"submit\">完成注册</button>
           </form>
@@ -1214,7 +1136,7 @@ ORDER_TEMPLATE = """
     <div class=\"page\">
       <div class=\"page__inner\">
         <div class=\"nav-bar\">
-          <span>当前用户：{{ session.get('identifier', '访客') }}</span>
+          <span>当前用户：{{ session.get('phone', '访客') }}</span>
           <a href=\"{{ url_for('logout') }}\">退出登录</a>
         </div>
         <div class=\"hero\">
@@ -1280,7 +1202,7 @@ ORDER_SUCCESS_TEMPLATE = """
     <div class=\"page\">
       <div class=\"page__inner\">
         <div class=\"nav-bar\">
-          <span>当前用户：{{ session.get('identifier', '访客') }}</span>
+          <span>当前用户：{{ session.get('phone', '访客') }}</span>
           <a href=\"{{ url_for('logout') }}\">退出登录</a>
         </div>
         <div class=\"hero\">
@@ -1290,7 +1212,7 @@ ORDER_SUCCESS_TEMPLATE = """
         </div>
         <div class=\"card\">
           <div class=\"order-summary\">
-            <div>订单号：{{ order_sn }}</div>
+            <div>订单 ID：{{ order_id }}</div>
             <div>当前状态：{{ order_status }}</div>
             {% if paid_at %}
             <div>支付时间：{{ paid_at }}</div>
